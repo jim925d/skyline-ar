@@ -18,7 +18,7 @@
  * data, not responses.
  */
 
-const VERSION    = "v1";
+const VERSION    = "v2";
 const SHELL      = `skyline-shell-${VERSION}`;
 const TILES      = "skyline-tiles-v1";      // deliberately not version-bumped
 const TILE_MATCH = "elevation-tiles-prod";

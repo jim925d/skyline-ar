@@ -489,5 +489,105 @@ console.log("\n-- viewpoint follows the phone --");
   }
 }
 
+console.log("\n-- compass permission, and the 'Waiting for the compass' dead end --");
+{
+  const noThrow = (fn, what) => { try { fn(); ok(true, what); } catch (e) { ok(false, `${what} -- threw ${e}`); } };
+
+  { /* THE BUG. iOS requires requestPermission() to run while the tap's user
+       activation is still live. Awaiting getUserMedia spends it, so asking for
+       the camera first makes the compass request reject and the overlay sits on
+       "Waiting for the compass…" forever with nothing to act on. */
+    const h = load({});
+    await h.el("btnStart").onclick();
+    ok(h.calls.length === 2, `Start camera makes both permission calls (${h.calls.join(" then ")})`);
+    ok(h.calls[0] === "requestPermission",
+       "compass permission is requested BEFORE the camera, while the tap's activation is alive");
+    ok(h.calls.indexOf("requestPermission") < h.calls.indexOf("getUserMedia"),
+       "...and getUserMedia never runs first");
+  }
+
+  { // the same ordering must hold on the Camera/Drawing toggle
+    const h = load({});
+    h.api.state.mode = "draw";
+    await h.el("btnMode").onclick();
+    ok(h.calls[0] === "requestPermission", "the mode toggle asks for the compass first too");
+  }
+
+  { // each failure mode is named, not swallowed
+    const h = load({});
+    h.orient.permission = "denied";
+    ok(await h.api.askMotion() === "denied", "a declined prompt reports 'denied'");
+  }
+  { const h = load({});
+    h.orient.throwOn = { name: "NotAllowedError", msg: "requires a user gesture" };
+    ok(await h.api.askMotion() === "nogesture",
+       "a spent user gesture reports 'nogesture', not a generic failure");
+  }
+  { const h = load({});
+    h.orient.permission = null;                       // DeviceOrientationEvent absent
+    ok(await h.api.askMotion() === "unsupported", "a browser with no DeviceOrientationEvent reports 'unsupported'");
+  }
+  { const h = load({});
+    ok(await h.api.askMotion() === "granted", "a granted prompt reports 'granted'");
+    ok(h.hasListener("deviceorientation"), "...and the orientation listener is attached");
+    ok(h.hasListener("deviceorientationabsolute"), "...including the absolute one");
+  }
+
+  { /* The second bug: permission granted, no readings ever arrive (Motion &
+       Orientation Access off globally). The old watchdog only fired when events
+       HAD been seen, so zero events meant an indefinite spinner. */
+    const h = load({});
+    h.api.state.mode = "camera";
+    await h.api.askMotion();
+    ok(h.el("orientWarn").style.display !== "block", "no banner while it might still be coming");
+    h.runTimers();
+    ok(h.api.state.compassMsg !== null, "silence for 3.5s is diagnosed rather than left spinning");
+    ok(/isn't reporting/i.test(h.el("owTitle").textContent), "the banner names the problem");
+    ok(/Motion & Orientation/i.test(h.el("owBody").textContent),
+       "...and says exactly which iOS setting to check");
+    ok(h.el("owPrimary").textContent === "Retry compass", "a retry is offered");
+    ok(h.el("owSecondary").textContent === "Use drawing mode", "so is the working fallback");
+  }
+
+  { // a single reading means the compass is fine — no false alarm
+    const h = load({});
+    h.api.state.mode = "camera";
+    await h.api.askMotion();
+    h.fire("deviceorientation", { alpha: 12, beta: 80, gamma: 3, absolute: true });
+    ok(h.api.state.orient !== null, "an orientation reading lands in state");
+    h.runTimers();
+    ok(h.api.state.compassMsg === null, "having seen a reading, no 'not reporting' banner fires");
+  }
+
+  { // the canvas band stops being a mystery
+    const h = load({});
+    h.api.state.mode = "camera"; h.api.state.orient = null;
+    noThrow(() => h.api.draw(), "the no-compass band renders");
+    h.api.state.compassMsg = "Compass access was declined";
+    noThrow(() => h.api.draw(), "the band renders the diagnosed message too");
+  }
+
+  { // and there is a way back in without reloading
+    const h = load({});
+    h.orient.permission = "denied";
+    h.api.failNoCompass("denied");
+    ok(/declined/i.test(h.el("owTitle").textContent), "a declined prompt is reported as declined");
+    ok(/Settings › Safari/i.test(h.el("owBody").textContent), "with the iOS path to fix it");
+    h.orient.permission = "granted";
+    await h.api.retryCompass();
+    ok(h.api.state.compassMsg === null, "Retry clears the failure once permission is granted");
+    ok(h.el("orientWarn").style.display === "none", "...and dismisses the banner");
+    ok(h.el("btnRetryCompass") !== undefined, "a retry also lives in the Setup tray");
+  }
+
+  { // drawing mode must stay reachable through all of this
+    const h = load({});
+    h.api.failNoCompass("silent");
+    h.el("owSecondary").onclick();
+    ok(h.api.state.mode === "draw", "'Use drawing mode' actually switches modes");
+    noThrow(() => h.api.draw(), "and drawing mode renders");
+  }
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

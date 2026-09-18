@@ -106,12 +106,10 @@
   </div>
 
   <div id="orientWarn">
-    <b>This phone's compass isn't north-referenced.</b>
-    It reports relative orientation only, so the overlay would drift away from the real skyline with no
-    warning. Switched to the drawn panorama, which doesn't need a compass.
+    <b id="owTitle"></b> <span id="owBody"></span>
     <div class="acts">
-      <button id="warnStay">Stay in drawing mode</button>
-      <button id="warnCamera">Use the camera anyway</button>
+      <button id="owPrimary"></button>
+      <button id="owSecondary"></button>
     </div>
   </div>
 
@@ -156,6 +154,7 @@
         <button class="btn primary" id="btnCal">Calibrate FOV</button>
         <button class="btn" id="btnReset">Reset alignment</button>
       </div>
+      <button class="btn" id="btnRetryCompass" style="margin-top:.5rem">Retry compass access</button>
       <p class="note" id="calState" style="margin-top:.4rem"></p>
       <p class="note" style="margin-top:.5rem">Easier way: tap Align, then drag the screen until the drawn ridges sit on the real ones. Sideways drag fixes the compass, up-down fixes the tilt.</p>
     </fieldset>
@@ -314,7 +313,8 @@ const state={
   aligning:false, locked:false,
   orient:null,                 // {alpha,beta,gamma} degrees, north-referenced
   absoluteOk:null,             // null unknown / true north-referenced / false relative-only
-  sawOrientation:false, nonAbsoluteHandled:false, absoluteOverride:false, _absTimer:null,
+  sawOrientation:false, nonAbsoluteHandled:false, absoluteOverride:false,
+  _absTimer:null, _silenceTimer:null, compassMsg:null,
   screenAngle:0,
   drawAz:270, drawAlt:2.2, drawFov:90,
   peaks:PEAKS.slice(), visible:[], selected:null,
@@ -841,6 +841,7 @@ function calDrag(x,y){
   savePrefs(); calPaint(); draw();
 }
 
+$("btnRetryCompass").onclick=retryCompass;
 $("btnCal").onclick=calStart;
 $("calCancel").onclick=calStop;
 $("calNext").onclick=()=>{
@@ -861,9 +862,13 @@ function draw(){
 function drawAR(){
   const basis=basisFromOrientation();
   if(!basis){
-    ctx.fillStyle="rgba(9,15,22,.7)"; ctx.fillRect(0,H/2-26,W,52);
+    ctx.fillStyle="rgba(9,15,22,.7)"; ctx.fillRect(0,H/2-34,W,68);
     ctx.fillStyle="#e6edf3"; ctx.font="500 14px ui-sans-serif,-apple-system,sans-serif";
-    ctx.textAlign="center"; ctx.fillText("Waiting for the compass…",W/2,H/2+5); ctx.textAlign="left";
+    ctx.textAlign="center";
+    ctx.fillText(state.compassMsg||"Waiting for the compass…",W/2,H/2-4);
+    ctx.font="400 11px ui-sans-serif,sans-serif"; ctx.fillStyle="#93a7b8";
+    ctx.fillText(state.compassMsg?"See the banner above, or switch to Drawing.":"Tilt the phone if nothing happens.",W/2,H/2+16);
+    ctx.textAlign="left";
     return;
   }
   const f=focalPx();
@@ -1170,13 +1175,25 @@ function startLoop(){
   requestAnimationFrame(tick);
 }
 
+/* Returns "granted" | "denied" | "unsupported" | "nogesture".
+
+   iOS requires DeviceOrientationEvent.requestPermission() to be called while a
+   user gesture is still active. Awaiting getUserMedia first spends that
+   activation, so requestPermission() then rejects and the overlay sits on
+   "Waiting for the compass…" forever. Callers must therefore await this BEFORE
+   touching the camera -- getUserMedia needs a secure context but not a
+   gesture, so that order works and the reverse does not. */
 async function askMotion(){
-  try{
-    if(typeof DeviceOrientationEvent!=="undefined"&&DeviceOrientationEvent.requestPermission){
-      const r=await DeviceOrientationEvent.requestPermission();
-      if(r!=="granted") return false;
+  if(typeof DeviceOrientationEvent==="undefined") return "unsupported";
+  if(DeviceOrientationEvent.requestPermission){
+    let r;
+    try{ r=await DeviceOrientationEvent.requestPermission(); }
+    catch(e){
+      /* NotAllowedError here almost always means the gesture was already spent. */
+      return /gesture|user activation|NotAllowed/i.test(String(e&&(e.name+e.message))) ? "nogesture" : "denied";
     }
-  }catch(e){ return false; }
+    if(r!=="granted") return "denied";
+  }
   /* Absolute vs relative orientation.
      iOS exposes webkitCompassHeading, which is true-north referenced.
      Android should fire deviceorientationabsolute, or set ev.absolute on
@@ -1201,23 +1218,71 @@ async function askMotion(){
   state._absTimer=setTimeout(()=>{
     if(state.sawOrientation&&state.absoluteOk!==true) failNonAbsolute();
   },2500);
-  return true;
+
+  /* And watch for the other failure: permission granted, nothing ever arrives.
+     The old code only checked the relative-compass case, so zero events meant
+     an indefinite "Waiting for the compass…" with nothing to act on. */
+  clearTimeout(state._silenceTimer);
+  state._silenceTimer=setTimeout(()=>{
+    if(!state.sawOrientation&&state.mode==="camera") failNoCompass("silent");
+  },3500);
+  return "granted";
 }
+
+function showOrientWarn(title,body,primary,secondary){
+  $("owTitle").textContent=title;
+  $("owBody").textContent=body;
+  const p=$("owPrimary"), q=$("owSecondary");
+  p.textContent=primary.label; p.onclick=primary.fn;
+  q.textContent=secondary.label; q.onclick=secondary.fn;
+  $("orientWarn").style.display="block";
+}
+const hideOrientWarn=()=>{ $("orientWarn").style.display="none"; };
+
+const toDrawing=()=>{ hideOrientWarn(); state.mode="draw"; setModeUI(); refresh(); };
+const cameraAnyway=async()=>{
+  hideOrientWarn(); state.absoluteOverride=true;
+  if(!vid.srcObject){ const ok=await startCamera(); if(!ok) return; }
+  state.mode="camera"; setModeUI(); startLoop(); draw();
+};
 
 function failNonAbsolute(){
   if(state.nonAbsoluteHandled) return;
   state.nonAbsoluteHandled=true;
   state.mode="draw"; setModeUI();
-  $("orientWarn").style.display="block";
+  showOrientWarn("This phone's compass isn't north-referenced.",
+    "It reports relative orientation only, so the overlay would drift away from the real skyline with no warning. Switched to the drawn panorama, which doesn't need a compass.",
+    {label:"Stay in drawing mode",fn:hideOrientWarn},
+    {label:"Use the camera anyway",fn:cameraAnyway});
   refresh();
 }
-$("warnStay").onclick=()=>{ $("orientWarn").style.display="none"; };
-$("warnCamera").onclick=async()=>{
-  $("orientWarn").style.display="none";
-  state.absoluteOverride=true;
-  if(!vid.srcObject){ const ok=await startCamera(); if(!ok) return; }
-  state.mode="camera"; setModeUI(); startLoop(); draw();
-};
+
+/* No orientation events at all. Distinct from the relative-compass case above,
+   and much more common: on iOS the usual causes are a declined prompt (Safari
+   only asks once per origin) or Motion & Orientation Access switched off
+   globally. Neither is discoverable from a spinner that says "waiting". */
+function failNoCompass(reason){
+  state.compassMsg = reason==="denied"
+    ? "Compass access was declined"
+    : "The compass isn't reporting";
+  const body = reason==="denied"
+    ? "Safari only asks once per site. To grant it: Settings › Safari › Motion & Orientation Access, turn it on, then reload this page and tap Retry compass."
+    : reason==="unsupported"
+    ? "This browser doesn't report device orientation, so the camera overlay can't track. The drawn panorama works without it."
+    : "Permission was granted but no readings are arriving. On iPhone check Settings › Safari › Motion & Orientation Access is on, then tap Retry compass.";
+  showOrientWarn(state.compassMsg+".", body,
+    {label:"Retry compass",fn:retryCompass},
+    {label:"Use drawing mode",fn:toDrawing});
+  draw();
+}
+/* Must run from a real tap: requestPermission() needs user activation. */
+async function retryCompass(){
+  hideOrientWarn();
+  state.compassMsg=null; state.orient=null; state.sawOrientation=false;
+  const r=await askMotion();
+  if(r!=="granted") failNoCompass(r);
+  else draw();
+}
 
 async function startCamera(){
   const warn=$("gateWarn");
@@ -1239,12 +1304,17 @@ async function startCamera(){
 }
 
 $("btnStart").onclick=async()=>{
-  const ok=await startCamera();
-  if(!ok) return;
+  /* Order matters. requestPermission() needs the tap's user activation, and
+     awaiting getUserMedia spends it, so the compass is asked for first. */
   const m=await askMotion();
-  if(!m) $("gateWarn").textContent="Compass access declined — the overlay can't track without it.";
+  const ok=await startCamera();
+  if(!ok){
+    if(m!=="granted") $("gateWarn").textContent="Camera and compass both unavailable — use the drawn panorama.";
+    return;
+  }
   state.mode="camera"; $("btnMode").textContent="Camera"; $("btnMode").setAttribute("aria-pressed","true");
   $("gate").style.display="none";
+  if(m!=="granted") failNoCompass(m);
   if(state.follow) startFollow();
   startLoop(); refresh();
 };
@@ -1358,7 +1428,12 @@ function setModeUI(){
 }
 $("btnMode").onclick=async()=>{
   if(state.mode==="camera"){ state.mode="draw"; setModeUI(); draw(); return; }
-  if(!vid.srcObject){ const ok=await startCamera(); if(!ok){ $("gate").style.display="flex"; return; } await askMotion(); startLoop(); }
+  if(!vid.srcObject||!state.orient){
+    const m=await askMotion();                       // before the camera, same reason
+    if(!vid.srcObject){ const ok=await startCamera(); if(!ok){ $("gate").style.display="flex"; return; } }
+    startLoop();
+    if(m!=="granted"){ state.mode="camera"; setModeUI(); failNoCompass(m); return; }
+  }
   state.mode="camera"; setModeUI(); draw();
 };
 $("btnAlign").onclick=()=>{

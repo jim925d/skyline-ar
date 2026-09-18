@@ -154,6 +154,10 @@ solve, or whether you dragged the marker onto the right summit. Those are field 
   covered, escape hatch removed.
 - **Default FOV (67°)** — still the shipped default, but now solvable in the field rather than
   eyeballed. Calibrate once and it persists.
+- **Compass permission on iOS** — *handled.* `DeviceOrientationEvent.requestPermission()` needs the
+  tap's user activation, and awaiting `getUserMedia` spends it, so the compass is now asked for
+  before the camera. Granted-but-silent is watchdogged separately and names the iOS setting to
+  check; both failures offer Retry and the drawing-mode fallback.
 - **Android absolute orientation** — *handled.* Orientation events are tagged by source; if none are
   absolute 2.5 s after permission, the app switches to the drawn panorama and says why rather than
   drifting silently. "Use the camera anyway" keeps a warning bar across the overlay.
