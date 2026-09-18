@@ -43,6 +43,18 @@ export function load({ width = 390, height = 780, screenAngle = 0 } = {}) {
   const getEl = id => { if (!els.has(id)) els.set(id, stubEl(id)); return els.get(id); };
 
   const store = new Map();
+  /* Drivable geolocation: tests push fixes through geo.fix(...) rather than
+     waiting on a real device. */
+  const geo = {
+    nextId: 0, cb: null, errCb: null, cleared: [], opts: null,
+    watchPosition(cb, err, opts) { this.cb = cb; this.errCb = err; this.opts = opts; return ++this.nextId; },
+    clearWatch(id) { this.cleared.push(id); },
+    getCurrentPosition(cb, err) { this.cb = cb; this.errCb = err; },
+    fix(latitude, longitude, { accuracy = 8, altitude = null } = {}) {
+      this.cb && this.cb({ coords: { latitude, longitude, accuracy, altitude } });
+    },
+    fail(code) { this.errCb && this.errCb({ code }); },
+  };
   const sandbox = {
     console, Math, Date, JSON, Number, String, Array, Object, Float32Array, Set, Map,
     isNaN, parseFloat, parseInt, alert: () => {},
@@ -55,7 +67,7 @@ export function load({ width = 390, height = 780, screenAngle = 0 } = {}) {
                                return r; } },        // never fires: cache lookups stay pending, which is fine
     Worker: undefined,
     Float64Array, Int16Array, Int8Array, Promise, Function, Error, performance: { now: () => 0 },
-    navigator: { geolocation: null, mediaDevices: null },
+    navigator: { geolocation: geo, mediaDevices: null },
     document: { getElementById: getEl, createElement: () => stubEl("new"),
                 addEventListener(){}, body: stubEl("body") },
     _store: store,
@@ -68,11 +80,11 @@ export function load({ width = 390, height = 780, screenAngle = 0 } = {}) {
   sandbox.DeviceOrientationEvent = undefined;
 
   const ctx = vm.createContext(sandbox);
-  vm.runInContext(src + "\n;globalThis.__api={state,basisFromOrientation,projectAR,focalPx,fovFromFocal,worldVec,dot,compute,draw,resize,dist,bearing,apparentAlt,loadPrefs,savePrefs,syncPrefControls,solveAxis,solveFov,calStart,calPick,calStop,calDrag,drawAR,drawPanorama,horizonAltAt,horizonDistAt,viewKey,currentKey};", ctx,
+  vm.runInContext(src + "\n;globalThis.__api={state,basisFromOrientation,projectAR,focalPx,fovFromFocal,worldVec,dot,compute,draw,resize,dist,bearing,apparentAlt,loadPrefs,savePrefs,flushPrefs,syncPrefControls,solveAxis,solveFov,calStart,calPick,calStop,calDrag,drawAR,drawPanorama,horizonAltAt,horizonDistAt,viewKey,currentKey,startFollow,stopFollow,loadFix,saveFix,onGroundElev,syncInputs};", ctx,
                   { filename: "index.html#script" });
 
   const api = vm.runInContext("__api", ctx);
   // the canvas stub reports 390x780; resize() picks it up
   api.state.screenAngle = screenAngle;
-  return { api, sandbox, el: getEl, W: width, H: height };
+  return { api, sandbox, el: getEl, geo, W: width, H: height };
 }

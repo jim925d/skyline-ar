@@ -289,11 +289,30 @@ async function build(job) {
   }, [alt.buffer, srcLat.buffer, srcLon.buffer, srcDist.buffer]);
 }
 
+/* Ground elevation for one point, from the same tiles the raycast uses.
+   A phone's GPS altitude is the worst number it produces -- frequently null on
+   iOS, and tens of metres out when present -- and the viewpoint height feeds
+   straight into every apparent-altitude calculation. One z12 tile answers it to
+   the metre, costs about 100 KB, is very often already cached from a horizon
+   build, and is served from the service worker's tile cache when offline. */
+async function elevationAt(lat, lon) {
+  const z = 12;
+  const [fx, fy] = lonLatToTile(lon, lat, z);
+  await fetchTile(z, Math.floor(fx), Math.floor(fy));
+  const e = sampleElev(Math.sin(lat * D2R), lon, z);
+  return e === e ? e : null;
+}
+
 function post(msg, transfer) { transfer ? self.postMessage(msg, transfer) : self.postMessage(msg); }
 
 self.onmessage = async ev => {
   const job = ev.data;
   if (job.type === "cancel") { cancelled = true; return; }
+  if (job.type === "elev") {
+    try { post({ type: "elev", id: job.id, elev: await elevationAt(job.lat, job.lon) }); }
+    catch (e) { post({ type: "elev", id: job.id, elev: null }); }
+    return;
+  }
   if (job.type !== "horizon") return;
   try { await build(job); }
   catch (e) { post({ type: "error", id: job.id, message: String(e && e.message || e) }); }

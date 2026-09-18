@@ -197,6 +197,18 @@ console.log("\n-- FOV calibration solvers --");
     near(api.state.fovLong, 67, 1e-9, "...and leaves the FOV untouched");
   }
 
+  { // a backgrounded phone must not lose the alignment
+    const h = load({});
+    h.api.state.headOff = -4.25; h.api.savePrefs();   // debounced; timers are stubbed out
+    ok(h.sandbox.localStorage.getItem("skyline-ar.prefs.v1") === null,
+       "the debounce really is holding the write back");
+    h.api.flushPrefs();
+    const o = JSON.parse(h.sandbox.localStorage.getItem("skyline-ar.prefs.v1"));
+    near(o.headOff, -4.25, 1e-9, "flushing on pagehide writes the pending alignment");
+    h.api.flushPrefs();
+    ok(true, "flushing twice is harmless");
+  }
+
   { // a solved FOV survives a reload
     const a = load({});
     a.sandbox.localStorage.setItem("skyline-ar.prefs.v1",
@@ -351,6 +363,129 @@ console.log("\n-- horizon profile: lookup, occlusion, both render paths --");
     const a = api.viewKey(39.7392, -104.9903, 1610.7);
     ok(api.viewKey(39.7395, -104.9906, 1613) === a, "a 40 m GPS wobble keeps the same cache key");
     ok(api.viewKey(39.9990, -105.2820, 1751.7) !== a, "a different viewpoint gets a different key");
+  }
+}
+
+console.log("\n-- viewpoint follows the phone --");
+{
+  const DENVER = [39.7392, -104.9903];
+  const BOULDER = [39.9990, -105.2820];
+
+  { // the app comes up following, not parked on a hardcoded city
+    const { api, geo } = load({});
+    ok(api.state.follow === true, "follow is on by default");
+    ok(geo.cb !== null, "a position watch is armed at boot");
+    ok(geo.opts && geo.opts.enableHighAccuracy === true, "the watch asks for high accuracy");
+  }
+
+  { // a fix moves the viewpoint and everything computed from it
+    const { api, geo } = load({});
+    const before = { lat: api.state.lat, lon: api.state.lon };
+    geo.fix(BOULDER[0], BOULDER[1], { accuracy: 6, altitude: 1740 });
+    near(api.state.lat, BOULDER[0], 1e-9, "latitude follows the fix");
+    near(api.state.lon, BOULDER[1], 1e-9, "longitude follows the fix");
+    ok(api.state.label === "Your location", "the readout says it is your location");
+    ok(api.state.lat !== before.lat, "the hardcoded default was actually replaced");
+    near(api.state.acc, 6, 1e-9, "accuracy is kept for the readout");
+    // peaks are now resolved from the new place
+    api.compute();
+    ok(api.state.visible.length > 0, "peaks recompute against the new viewpoint");
+  }
+
+  { // GPS jitter must not thrash the recompute or the horizon cache
+    const { api, geo } = load({});
+    geo.fix(DENVER[0], DENVER[1], { accuracy: 5 });
+    const settled = { lat: api.state.lat, lon: api.state.lon };
+    geo.fix(DENVER[0] + 0.0002, DENVER[1], { accuracy: 5 });   // ~22 m
+    near(api.state.lat, settled.lat, 1e-9, "a 22 m wobble is ignored");
+    geo.fix(DENVER[0] + 0.0010, DENVER[1], { accuracy: 5 });   // ~111 m
+    ok(api.state.lat !== settled.lat, "a real 111 m move is taken");
+  }
+
+  { // DEM ground height beats GPS altitude
+    const { api, geo } = load({});
+    geo.fix(DENVER[0], DENVER[1], { accuracy: 5, altitude: 1550 });
+    near(api.state.elev, 1550, 1e-9, "GPS altitude is used as a placeholder");
+    ok(api.state.elevFromDem === false, "...and is flagged as not from the DEM");
+    api.onGroundElev({ id: "e1", elev: 1609.4 });
+    // the pending id will not match, so nothing should change -- guard against blind writes
+    near(api.state.elev, 1550, 1e-9, "an elevation reply with an unknown id is ignored");
+  }
+
+  { // choosing a saved viewpoint is an explicit override
+    const { api, geo, el } = load({});
+    geo.fix(BOULDER[0], BOULDER[1]);
+    ok(api.state.follow === true, "still following before the override");
+    const sel = el("view");
+    sel.value = "0";
+    sel.onchange();
+    ok(api.state.follow === false, "picking a saved viewpoint stops following");
+    ok(geo.cleared.length > 0, "...and clears the position watch rather than leaking it");
+    near(api.state.lat, 39.7392, 1e-9, "the saved viewpoint's coordinates are used");
+  }
+
+  { // typed coordinates are an override too
+    const { api, el } = load({});
+    el("lat").value = "40.0"; el("lon").value = "-105.5"; el("elev").value = "2500";
+    el("btnApply").onclick();
+    ok(api.state.follow === false, "typing coordinates stops following");
+    near(api.state.lat, 40.0, 1e-9, "typed latitude is used");
+  }
+
+  { // and you can get back to following
+    const { api, el } = load({});
+    el("lat").value = "40.0"; el("lon").value = "-105.5"; el("elev").value = "2500";
+    el("btnApply").onclick();
+    ok(api.state.follow === false, "override in place");
+    el("btnGeo").onclick();
+    ok(api.state.follow === true, "'Follow my location' turns following back on");
+  }
+
+  { // the choice persists
+    const a = load({});
+    a.api.stopFollow();
+    a.api.flushPrefs();
+    const raw = a.sandbox.localStorage.getItem("skyline-ar.prefs.v1");
+    ok(raw !== null && JSON.parse(raw).follow === false, "follow:false is persisted");
+    const b = load({});
+    b.sandbox.localStorage.setItem("skyline-ar.prefs.v1", raw);
+    b.api.loadPrefs();
+    ok(b.api.state.follow === false, "follow:false survives a reload");
+  }
+
+  { // a cold start with no signal comes up where you last were, not in Denver
+    const a = load({});
+    a.geo.fix(BOULDER[0], BOULDER[1], { accuracy: 5, altitude: 1740 });
+    const fix = a.sandbox.localStorage.getItem("skyline-ar.lastfix.v1");
+    ok(fix !== null, "the last fix is written to storage");
+
+    const b = load({});
+    b.sandbox.localStorage.setItem("skyline-ar.lastfix.v1", fix);
+    b.api.loadFix();
+    near(b.api.state.lat, BOULDER[0], 1e-6, "a cold start restores the last known latitude");
+    ok(b.api.state.label === "Last known position", "...and says so rather than pretending it is a fix");
+
+    const c = load({});
+    c.sandbox.localStorage.setItem("skyline-ar.lastfix.v1", "{corrupt");
+    ok(c.api.loadFix() === false, "corrupt stored position is refused");
+    near(c.api.state.lat, 39.7392, 1e-9, "...falling back to the built-in default");
+  }
+
+  { // denial must be legible, not silent
+    const { api, geo, el } = load({});
+    geo.fail(1);
+    ok(/denied/i.test(el("locNote").textContent), "a denied permission says so");
+    geo.fail(3);
+    ok(/timed out/i.test(el("locNote").textContent), "a timeout says so");
+    ok(typeof api.state.lat === "number", "the app still has a usable viewpoint after a failure");
+  }
+
+  { // no geolocation at all
+    const h = load({});
+    h.sandbox.navigator.geolocation = null;
+    h.api.startFollow();
+    ok(/won't share a location/i.test(h.el("locNote").textContent),
+       "a browser with no geolocation is told to set coordinates by hand");
   }
 }
 

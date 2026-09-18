@@ -18,7 +18,8 @@ python3 -m http.server 8000     # then use a tunnel (ngrok/cloudflared) for http
 # GitHub Pages: Settings -> Pages -> Deploy from branch -> main / root
 ```
 
-Open the https URL on a phone, tap **Start camera**, grant camera, motion and location.
+Open the https URL on a phone, tap **Start camera**, grant camera, motion and location. The
+viewpoint follows the phone from then on.
 
 Add it to the home screen and it installs as a standalone app and works with no signal. The app
 shell, the peak list and the raycaster are precached; terrain tiles live in their own cache that an
@@ -46,7 +47,12 @@ IndexedDB. Build a horizon while you have signal and it will be there on the rid
   near the edge to pin the scale — with the axis fixed, screen radius from centre is exactly
   proportional to focal length, so `f_new = f_old * r_wanted / r_drawn`
 - **Persistence** — FOV, heading offset, pitch offset, units, range, minimum angle and the sun
-  toggle survive a reload, under `skyline-ar.prefs.v1`. Values are clamped and type-checked on read
+  toggle survive a reload, under `skyline-ar.prefs.v1`. Values are clamped and type-checked on read,
+  and pending writes are flushed on `pagehide` so locking the phone costs you nothing
+- **Viewpoint follows the phone** — `watchPosition` by default, recomputing when you move more than
+  40 m. Ground height comes from the DEM tiles rather than GPS altitude. The saved viewpoints are an
+  override you choose, not a default you have to escape; the last fix is stored so a cold start with
+  no signal opens where you were, not in Denver
 - **Sun** — NOAA-simplified solar position, full day arc plus current disc
 - **Peak data** — ~56 hand-entered Colorado summits, plus an Overpass (OpenStreetMap) loader for
   anywhere else, with a copy-paste fallback when the browser blocks the request

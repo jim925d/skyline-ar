@@ -162,16 +162,17 @@
 
     <fieldset>
       <legend>Where you're standing</legend>
-      <label for="view">Saved viewpoints</label>
+      <label for="view">Viewpoint</label>
       <select id="view"></select>
+      <p class="note" id="locNote" style="margin-top:.4rem"></p>
       <div class="row3" style="margin-top:.5rem">
         <div><label for="lat">Latitude</label><input id="lat" inputmode="decimal"></div>
         <div><label for="lon">Longitude</label><input id="lon" inputmode="decimal"></div>
         <div><label for="elev">Elevation (m)</label><input id="elev" inputmode="decimal"></div>
       </div>
       <div class="row" style="margin-top:.5rem">
-        <button class="btn" id="btnGeo">Use my location</button>
-        <button class="btn primary" id="btnApply">Apply</button>
+        <button class="btn primary" id="btnGeo">Follow my location</button>
+        <button class="btn" id="btnApply">Use these coordinates</button>
       </div>
     </fieldset>
 
@@ -306,6 +307,7 @@ function sunPos(date,lat,lon){
 
 const state={
   lat:39.7392, lon:-104.9903, elev:1609, eye:1.7, label:"Denver — Civic Center",
+  follow:true, acc:null, elevFromDem:false,
   range:160, minAng:-0.6, units:"ft", sun:true,
   mode:"draw",                 // "camera" | "draw"
   fovLong:67, headOff:0, pitchOff:0, fovCalibrated:false, cal:null,
@@ -324,7 +326,7 @@ const state={
    should survive a reload, a backgrounded tab and a lost camera permission. */
 
 const PREFS_KEY="skyline-ar.prefs.v1";
-const PREFS_FIELDS=["fovLong","headOff","pitchOff","units","range","minAng","sun","fovCalibrated"];
+const PREFS_FIELDS=["fovLong","headOff","pitchOff","units","range","minAng","sun","fovCalibrated","follow"];
 
 function loadPrefs(){
   let raw;
@@ -340,15 +342,27 @@ function loadPrefs(){
   if(o.units==="ft"||o.units==="m") state.units=o.units;
   if(typeof o.sun==="boolean") state.sun=o.sun;
   state.fovCalibrated=!!o.fovCalibrated;
+  if(typeof o.follow==="boolean") state.follow=o.follow;
 }
-let saveTimer=null;
+let saveTimer=null, savePending=false;
 function savePrefs(){
+  savePending=true;
   clearTimeout(saveTimer);
-  saveTimer=setTimeout(()=>{
-    const o={}; for(const k of PREFS_FIELDS) o[k]=state[k];
-    try{ localStorage.setItem(PREFS_KEY,JSON.stringify(o)); }catch(e){}
-  },250);
+  saveTimer=setTimeout(flushPrefs,250);
 }
+function flushPrefs(){
+  if(!savePending) return;
+  savePending=false; clearTimeout(saveTimer);
+  const o={}; for(const k of PREFS_FIELDS) o[k]=state[k];
+  try{ localStorage.setItem(PREFS_KEY,JSON.stringify(o)); }catch(e){}
+}
+/* The debounce keeps a drag from hammering storage, but a phone locking or
+   Safari suspending the tab must not cost you the alignment you just dialled in.
+   pagehide is the one iOS actually delivers. */
+window.addEventListener("pagehide",flushPrefs);
+window.addEventListener("visibilitychange",()=>{
+  if(typeof document!=="undefined"&&document.visibilityState==="hidden") flushPrefs();
+});
 function clearPrefs(){ try{ localStorage.removeItem(PREFS_KEY); }catch(e){} }
 const clampNum=(v,a,b)=>Math.max(a,Math.min(b,v));
 
@@ -445,13 +459,20 @@ async function loadCachedHorizon(){
 }
 
 let demWorker=null, demJob=0;
+function getWorker(){
+  if(demWorker) return demWorker;
+  if(!window.Worker) return null;
+  try{
+    demWorker=new Worker("horizon-worker.js");
+    demWorker.onmessage=demMessage;
+    demWorker.onerror=e=>{ state.demBusy=false; demButton();
+      demStatus("Couldn't start the raycaster: "+(e.message||"worker failed to load")); };
+  }catch(e){ return null; }
+  return demWorker;
+}
 function demStart(){
   if(state.demBusy){ demCancel(); return; }
-  if(!window.Worker){ demStatus("This browser has no Web Workers, so the raycast can't run."); return; }
-  try{ if(!demWorker){ demWorker=new Worker("horizon-worker.js"); demWorker.onmessage=demMessage;
-        demWorker.onerror=e=>{ state.demBusy=false; demButton();
-          demStatus("Couldn't start the raycaster: "+(e.message||"worker failed to load")); }; } }
-  catch(e){ demStatus("Couldn't start the raycaster: "+e.message); return; }
+  if(!getWorker()){ demStatus("This browser has no Web Workers, so the raycast can't run."); return; }
 
   state.demBusy=true; demButton();
   const id=++demJob;
@@ -467,6 +488,7 @@ function demButton(){ const b=$("btnDem"); if(b) b.textContent=state.demBusy?"Ca
 
 async function demMessage(ev){
   const m=ev.data;
+  if(m.type==="elev"){ onGroundElev(m); return; }
   if(m.id!==demJob&&m.type!=="cancelled") return;
   if(m.type==="progress"){
     demStatus(m.phase==="tiles"
@@ -494,6 +516,102 @@ $("btnDemClear").onclick=async()=>{
   if(keep) await idbDo("readwrite",st=>st.put(keep));   // peaks are not horizons
   state.horizon=null; demStatus("Cached horizons cleared."); demSyncNote(); refresh();
 };
+
+/* ---------------- where you are ---------------- */
+
+/* The viewpoint follows the phone by default. Everything downstream -- bearings,
+   distances, apparent altitudes, which horizon profile is cached -- is measured
+   from here, so a stale or guessed position is wrong in a way that looks
+   plausible. The saved viewpoints are still there, but they are an override you
+   choose, not the default you have to escape from. */
+
+const LOC_KEY="skyline-ar.lastfix.v1";
+const FOLLOW_MIN_MOVE=40;          // metres before a new fix is worth recomputing
+
+function locNote(msg){ const el=$("locNote"); if(el) el.textContent=msg; }
+
+function saveFix(){
+  try{ localStorage.setItem(LOC_KEY,JSON.stringify(
+    {lat:state.lat,lon:state.lon,elev:state.elev,dem:state.elevFromDem,t:Date.now()})); }catch(e){}
+}
+/* A cold start with no signal should come up where you last were, not in Denver. */
+function loadFix(){
+  let o; try{ o=JSON.parse(localStorage.getItem(LOC_KEY)||"null"); }catch(e){ return false; }
+  if(!o||!Number.isFinite(o.lat)||!Number.isFinite(o.lon)) return false;
+  state.lat=o.lat; state.lon=o.lon;
+  if(Number.isFinite(o.elev)) state.elev=o.elev;
+  state.elevFromDem=!!o.dem;
+  state.label="Last known position";
+  return true;
+}
+
+let watchId=null, haveFix=false;
+
+function startFollow(){
+  state.follow=true; savePrefs(); syncViewSelect();
+  if(!navigator.geolocation){ locNote("This browser won't share a location — set coordinates by hand below."); return; }
+  if(watchId!==null) navigator.geolocation.clearWatch(watchId);
+  locNote(haveFix?"Following your location.":"Locating…");
+  /* watchPosition rather than a one-shot: you walk to the viewpoint, and the
+     first fix is usually the worst one the phone will give you. */
+  watchId=navigator.geolocation.watchPosition(onFix,onFixError,
+    {enableHighAccuracy:true, timeout:25000, maximumAge:10000});
+}
+function stopFollow(note){
+  state.follow=false; savePrefs();
+  if(watchId!==null&&navigator.geolocation){ navigator.geolocation.clearWatch(watchId); watchId=null; }
+  locNote(note||"Not following — using the viewpoint you set.");
+}
+
+function onFix(pos){
+  if(!state.follow) return;
+  const la=pos.coords.latitude, lo=pos.coords.longitude;
+  state.acc=pos.coords.accuracy;
+  const moved=haveFix?dist(state.lat,state.lon,la,lo):Infinity;
+  if(moved<FOLLOW_MIN_MOVE){ locNote(fixNote(0)); return; }
+
+  state.lat=la; state.lon=lo; state.label="Your location";
+  /* GPS altitude is the least trustworthy number the phone produces, so it is a
+     placeholder until the DEM answers. */
+  if(Number.isFinite(pos.coords.altitude)){ state.elev=pos.coords.altitude; state.elevFromDem=false; }
+  haveFix=true;
+  syncInputs(); syncViewSelect(); saveFix();
+  locNote(fixNote(moved));
+  askGroundElev(la,lo);
+  viewpointChanged();
+}
+function onFixError(err){
+  const why=err.code===1 ? "Location permission denied — set coordinates by hand, or allow location and tap Follow my location."
+          : err.code===3 ? "Location timed out. Still trying…"
+          : "Location unavailable right now.";
+  locNote(why + (haveFix?"":" Showing "+state.label+" until a fix arrives."));
+}
+function fixNote(moved){
+  const a=Number.isFinite(state.acc)?` ±${Math.round(state.acc)} m`:"";
+  const e=state.elevFromDem?" · ground height from elevation data":" · height from GPS, refining";
+  return `Following your location${a}${e}`;
+}
+
+/* Ground elevation from the DEM tiles, which is far better than GPS altitude. */
+let elevSeq=0; const elevPending=new Map();
+function askGroundElev(lat,lon){
+  const w=getWorker(); if(!w) return;
+  const id="e"+(++elevSeq);
+  elevPending.set(id,{lat,lon});
+  w.postMessage({type:"elev", id, lat, lon});
+}
+function onGroundElev(m){
+  const p=elevPending.get(m.id); elevPending.delete(m.id);
+  if(!p||!Number.isFinite(m.elev)) return;
+  if(dist(state.lat,state.lon,p.lat,p.lon)>FOLLOW_MIN_MOVE*2) return;   // moved on since
+  state.elev=m.elev; state.elevFromDem=true;
+  syncInputs(); saveFix(); locNote(fixNote(0)); refresh();
+}
+
+function syncViewSelect(){
+  const sel=$("view"); if(!sel) return;
+  sel.value=state.follow?"gps":(sel.value==="gps"?"":sel.value);
+}
 
 /* ---------------- peak computation ---------------- */
 
@@ -1127,14 +1245,14 @@ $("btnStart").onclick=async()=>{
   if(!m) $("gateWarn").textContent="Compass access declined — the overlay can't track without it.";
   state.mode="camera"; $("btnMode").textContent="Camera"; $("btnMode").setAttribute("aria-pressed","true");
   $("gate").style.display="none";
-  navigator.geolocation&&navigator.geolocation.getCurrentPosition(pos=>{
-    state.lat=pos.coords.latitude; state.lon=pos.coords.longitude;
-    if(pos.coords.altitude!=null) state.elev=pos.coords.altitude;
-    state.label="Your location"; syncInputs(); viewpointChanged();
-  },()=>{},{enableHighAccuracy:true,timeout:10000});
+  if(state.follow) startFollow();
   startLoop(); refresh();
 };
-$("btnSkip").onclick=()=>{ state.mode="draw"; setModeUI(); $("gate").style.display="none"; refresh(); };
+$("btnSkip").onclick=()=>{
+  state.mode="draw"; setModeUI(); $("gate").style.display="none";
+  if(state.follow) startFollow();     // the drawn panorama is still drawn from where you are
+  refresh();
+};
 
 /* ---------------- interaction ---------------- */
 
@@ -1270,29 +1388,27 @@ $("btnReset").onclick=()=>{ state.headOff=0; state.pitchOff=0; state.fovLong=67;
   clearPrefs(); calPaintState(); if(state.cal) calStop(); else draw(); };
 
 const sel=$("view");
+{ const o=document.createElement("option"); o.value="gps"; o.textContent="My location (GPS)"; sel.appendChild(o); }
 VIEWS.forEach((v,i)=>{const o=document.createElement("option");o.value=i;o.textContent=v[0];sel.appendChild(o);});
-sel.onchange=()=>{ const v=VIEWS[+sel.value]; state.lat=v[1];state.lon=v[2];state.elev=v[3];state.label=v[0];
-  syncInputs(); viewpointChanged(); };
+sel.onchange=()=>{
+  if(sel.value==="gps"){ startFollow(); return; }
+  stopFollow();
+  const v=VIEWS[+sel.value]; state.lat=v[1];state.lon=v[2];state.elev=v[3];state.label=v[0];
+  state.elevFromDem=false; syncInputs(); viewpointChanged();
+};
 function syncInputs(){
   $("lat").value=state.lat.toFixed(5); $("lon").value=state.lon.toFixed(5); $("elev").value=Math.round(state.elev);
-  $("where").innerHTML=`${state.label}<br>${state.lat.toFixed(4)}, ${state.lon.toFixed(4)} · ${fmtElev(state.elev)}`;
+  const tag=state.follow&&haveFix&&Number.isFinite(state.acc)?` ±${Math.round(state.acc)} m`:"";
+  $("where").innerHTML=`${state.label}${tag}<br>${state.lat.toFixed(4)}, ${state.lon.toFixed(4)} · ${fmtElev(state.elev)}`;
 }
 $("btnApply").onclick=()=>{
   const la=parseFloat($("lat").value),lo=parseFloat($("lon").value),el=parseFloat($("elev").value);
   if([la,lo,el].some(isNaN)){ alert("Latitude, longitude and elevation all need numbers."); return; }
-  state.lat=la;state.lon=lo;state.elev=el;state.label="Custom viewpoint";
+  stopFollow("Not following — using the coordinates you typed.");
+  state.lat=la;state.lon=lo;state.elev=el;state.label="Custom viewpoint"; state.elevFromDem=false;
   syncInputs(); viewpointChanged(); $("tray").classList.remove("open"); $("btnTray").textContent="Setup"; setTimeout(resize,230);
 };
-$("btnGeo").onclick=()=>{
-  if(!navigator.geolocation){ alert("This browser won't share a location."); return; }
-  $("btnGeo").textContent="Locating…";
-  navigator.geolocation.getCurrentPosition(pos=>{
-    state.lat=pos.coords.latitude; state.lon=pos.coords.longitude;
-    if(pos.coords.altitude!=null) state.elev=pos.coords.altitude;
-    state.label="Your location"; $("btnGeo").textContent="Use my location"; syncInputs(); viewpointChanged();
-  },()=>{ $("btnGeo").textContent="Use my location"; alert("Location unavailable — type coordinates instead."); },
-  {enableHighAccuracy:true,timeout:10000});
-};
+$("btnGeo").onclick=()=>{ haveFix=false; startFollow(); };
 $("range").oninput=e=>{ state.range=+e.target.value; $("rangeVal").textContent=state.range+" km"; savePrefs(); refresh(); };
 $("minang").oninput=e=>{ state.minAng=+e.target.value; $("minangVal").textContent=state.minAng.toFixed(1)+"°"; savePrefs(); refresh(); };
 
@@ -1434,6 +1550,7 @@ if(!window.isSecureContext){
   $("gateWarn").textContent="Heads up: this page isn't on https, so the camera and compass will be blocked. Host it and open the https link — the drawn panorama works either way.";
 }
 loadPrefs();
+loadFix();
 syncPrefControls();
 setModeUI();
 syncInputs();
@@ -1443,6 +1560,8 @@ demButton();
 loadCachedHorizon();
 loadAddedPeaks();
 registerSW();
+syncViewSelect();
+if(state.follow) startFollow(); else locNote("Not following — using the viewpoint you set.");
 </script>
 </body>
 </html>
