@@ -4,6 +4,15 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no">
 <title>Skyline AR — peaks through the camera</title>
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#0a1016">
+<meta name="description" content="Names the peaks on the horizon and draws them over the live camera.">
+<link rel="icon" href="icons/favicon-32.png" sizes="32x32">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Skyline">
 <style>
   :root{
     --ink:#0a1016; --panel:#0f1720; --panel-2:#16212c; --line:#26374a;
@@ -190,6 +199,12 @@
     <fieldset>
       <legend>Peaks in view</legend>
       <div class="peaklist" id="plist"></div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Offline</legend>
+      <p class="note" id="swNote">Checking…</p>
+      <button class="btn" id="btnUpdate" style="margin-top:.5rem;display:none">Reload to update</button>
     </fieldset>
 
     <fieldset>
@@ -474,7 +489,9 @@ async function demMessage(ev){
 
 $("btnDem").onclick=demStart;
 $("btnDemClear").onclick=async()=>{
+  const keep=await idbDo("readonly",st=>st.get("__peaks__"));
   await idbDo("readwrite",st=>st.clear());
+  if(keep) await idbDo("readwrite",st=>st.put(keep));   // peaks are not horizons
   state.horizon=null; demStatus("Cached horizons cleared."); demSyncNote(); refresh();
 };
 
@@ -1310,12 +1327,36 @@ function ingest(json){
   }
   return added;
 }
+
+/* Peaks pulled from OpenStreetMap only ever lived in memory, which meant a
+   reload on a ridge with no signal threw them away -- exactly when you need
+   them. Keep the added ones in IndexedDB alongside the horizon profiles. The
+   built-in Colorado list is in this file, so the service worker covers it. */
+async function saveAddedPeaks(){
+  const base=new Set(PEAKS.map(p=>p.n+"|"+p.lat.toFixed(3)));
+  const added=state.peaks.filter(p=>!base.has(p.n+"|"+p.lat.toFixed(3)));
+  await idbDo("readwrite",st=>st.put({key:"__peaks__",list:added,created:Date.now()}));
+  return added.length;
+}
+async function loadAddedPeaks(){
+  const rec=await idbDo("readonly",st=>st.get("__peaks__"));
+  if(!rec||!rec.list||!rec.list.length) return 0;
+  const have=new Set(state.peaks.map(p=>p.n+"|"+p.lat.toFixed(3)));
+  let n=0;
+  for(const p of rec.list){
+    const k=p.n+"|"+p.lat.toFixed(3);
+    if(have.has(k)) continue;
+    have.add(k); state.peaks.push(p); n++;
+  }
+  if(n) refresh();
+  return n;
+}
 $("btnOsm").onclick=async()=>{
   const st=$("osmStatus"); st.textContent="Asking OpenStreetMap…";
   const url="https://overpass-api.de/api/interpreter?data="+encodeURIComponent(overpassQuery());
   try{
     const res=await fetch(url); const json=await res.json();
-    st.textContent=`Added ${ingest(json)} summits.`; refresh();
+    st.textContent=`Added ${ingest(json)} summits.`; refresh(); await saveAddedPeaks();
   }catch(err){
     $("osmFallback").style.display="block"; $("osmUrl").value=url;
     st.textContent="Couldn't reach it from here — use the paste route below.";
@@ -1323,8 +1364,48 @@ $("btnOsm").onclick=async()=>{
 };
 $("btnPaste").onclick=()=>{
   try{ const n=ingest(JSON.parse($("osmPaste").value)); $("osmStatus").textContent=`Added ${n} summits.`;
-    $("osmPaste").value=""; refresh(); }
+    $("osmPaste").value=""; refresh(); saveAddedPeaks(); }
   catch(e){ $("osmStatus").textContent="That text wasn't valid JSON."; }
+};
+
+/* ---------------- offline ---------------- */
+
+/* Registered rather than inlined so the browser can update it independently of
+   the page. Scope is relative, so this works unchanged at the root of a domain
+   or under a project path on GitHub Pages. */
+function swNote(msg){ const el=$("swNote"); if(el) el.textContent=msg; }
+
+async function registerSW(){
+  if(!("serviceWorker" in navigator)){
+    swNote("This browser has no service worker support, so the app won't work offline."); return;
+  }
+  if(!window.isSecureContext){
+    swNote("Offline support needs https. On http the app still runs, it just won't install or cache."); return;
+  }
+  let reg;
+  try{ reg=await navigator.serviceWorker.register("sw.js",{scope:"./"}); }
+  catch(e){ swNote("Couldn't install the offline cache: "+e.message); return; }
+
+  const ready=()=>navigator.serviceWorker.controller
+    ? "Installed for offline use. The app, the peak list and any horizons you've built will open with no signal."
+    : "Offline cache installing — it'll be ready after one reload.";
+  swNote(ready());
+
+  reg.addEventListener("updatefound",()=>{
+    const sw=reg.installing; if(!sw) return;
+    sw.addEventListener("statechange",()=>{
+      if(sw.state==="installed"&&navigator.serviceWorker.controller){
+        swNote("A newer version is ready.");
+        const b=$("btnUpdate"); if(b) b.style.display="";
+      }
+    });
+  });
+  navigator.serviceWorker.addEventListener("controllerchange",()=>swNote(ready()));
+}
+$("btnUpdate").onclick=async()=>{
+  const reg=await navigator.serviceWorker.getRegistration();
+  if(reg&&reg.waiting) reg.waiting.postMessage("skipWaiting");
+  location.reload();
 };
 
 /* ---------------- boot ---------------- */
@@ -1360,6 +1441,8 @@ resize();
 refresh();
 demButton();
 loadCachedHorizon();
+loadAddedPeaks();
+registerSW();
 </script>
 </body>
 </html>

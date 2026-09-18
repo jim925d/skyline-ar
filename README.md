@@ -3,7 +3,8 @@
 Names the peaks on the horizon and draws them over the live camera. A browser-based take on
 [PeakFinder](https://www.peakfinder.com/).
 
-Single self-contained HTML file. No build step, no dependencies, no server code.
+No build step, no dependencies, no server code. Plain files, one origin: the app is `index.html`,
+the DEM raycaster is `horizon-worker.js`, offline is `sw.js` plus `manifest.webmanifest`.
 
 ## Run it
 
@@ -18,6 +19,11 @@ python3 -m http.server 8000     # then use a tunnel (ngrok/cloudflared) for http
 ```
 
 Open the https URL on a phone, tap **Start camera**, grant camera, motion and location.
+
+Add it to the home screen and it installs as a standalone app and works with no signal. The app
+shell, the peak list and the raycaster are precached; terrain tiles live in their own cache that an
+app update will not evict; horizon profiles and any peaks pulled from OpenStreetMap are kept in
+IndexedDB. Build a horizon while you have signal and it will be there on the ridge.
 
 ## What works
 
@@ -120,6 +126,7 @@ few metres lower than the survey.
 ```bash
 node test/projection.test.mjs   # geometry, calibration, prefs, render paths
 node test/horizon.test.mjs      # tile indexing, step ladder, raycast vs apparentAlt
+node test/offline.test.mjs      # precache list, manifest, no external scripts
 ```
 
 `test/harness.mjs` pulls the real `<script>` out of `index.html` and runs it against a minimal DOM
@@ -159,6 +166,16 @@ Everything is in `index.html`:
 | calibration block | Two-point FOV and axis solve |
 | `projectAR()` | Pinhole projection with alignment offsets |
 | `drawAR()` / `drawPanorama()` | The two render paths |
+
+## Files
+
+| File | What it is |
+| --- | --- |
+| `index.html` | The app — data, geodesy, projection, both render paths, UI |
+| `horizon-worker.js` | DEM tile fetch and horizon raycast, off the main thread |
+| `sw.js` | Service worker: app shell, terrain tile cache |
+| `manifest.webmanifest` | Home-screen install |
+| `test/` | Node-only checks, not shipped to the browser |
 
 ## License
 
