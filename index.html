@@ -107,10 +107,7 @@
       <div class="slider-row"><input type="range" id="fov" min="40" max="90" step="0.5" value="67"><span class="val" id="fovVal">67°</span></div>
       <label for="hoff" style="margin-top:.5rem">Compass correction</label>
       <div class="slider-row"><input type="range" id="hoff" min="-30" max="30" step="0.5" value="0"><span class="val" id="hoffVal">0°</span></div>
-      <div class="row" style="margin-top:.5rem">
-        <button class="btn" id="btnFlip">Flip landscape</button>
-        <button class="btn" id="btnReset">Reset alignment</button>
-      </div>
+      <button class="btn" id="btnReset" style="margin-top:.5rem">Reset alignment</button>
       <p class="note" style="margin-top:.5rem">Easier way: tap Align, then drag the screen until the drawn ridges sit on the real ones. Sideways drag fixes the compass, up-down fixes the tilt.</p>
     </fieldset>
 
@@ -242,7 +239,7 @@ const state={
   lat:39.7392, lon:-104.9903, elev:1609, eye:1.7, label:"Denver — Civic Center",
   range:160, minAng:-0.6, units:"ft", sun:true,
   mode:"draw",                 // "camera" | "draw"
-  fovLong:67, headOff:0, pitchOff:0, flip:false,
+  fovLong:67, headOff:0, pitchOff:0,
   aligning:false, locked:false,
   orient:null,                 // {alpha,beta,gamma} degrees, north-referenced
   screenAngle:0,
@@ -264,6 +261,9 @@ function resize(){
 }
 window.addEventListener("resize",resize);
 window.addEventListener("orientationchange",()=>setTimeout(resize,250));
+if(screen.orientation&&screen.orientation.addEventListener){
+  screen.orientation.addEventListener("change",()=>{ state.screenAngle=screen.orientation.angle||0; draw(); });
+}
 
 /* ---------------- peak computation ---------------- */
 
@@ -321,8 +321,20 @@ function basisFromOrientation(){
   const dX=[cZ*cY-sZ*sX*sY, cY*sZ+cZ*sX*sY, -cX*sY];
   const dY=[-cX*sZ,         cZ*cX,           sX    ];
   const dZ=[cY*sZ*sX+cZ*sY, sZ*sY-cZ*cY*sX,  cX*cY ];
-  let a=(state.screenAngle||0)*D2R;
-  if(state.flip) a=-a;
+  /* screen.orientation.angle is "the angle in degrees that the screen is rotated
+     counter-clockwise from its natural orientation" (W3C Screen Orientation).
+     angle = 90 therefore means the handset has been turned 90 deg CCW as the user
+     sees it: the hardware top edge (device +Y) now points to the user's left and
+     the hardware right edge (device +X) points up. The compositor re-renders the
+     page upright, so the page's "up" is device +X and the page's "right" is -Y:
+         A = 90  ->  right = -dY,  up = +dX
+     which is satisfied by
+         right = cos A * dX - sin A * dY
+         up    = sin A * dX + cos A * dY
+     with no sign flip. Verified against the Z-X'-Y'' basis above, which matches
+     the W3C DeviceOrientation rotation matrix column for column.
+     (Assumes a portrait-natural device -- true for every iPhone.) */
+  const a=(state.screenAngle||0)*D2R;
   const ca=Math.cos(a), sa=Math.sin(a);
   const right=[ca*dX[0]-sa*dY[0], ca*dX[1]-sa*dY[1], ca*dX[2]-sa*dY[2]];
   const up   =[sa*dX[0]+ca*dY[0], sa*dX[1]+ca*dY[1], sa*dX[2]+ca*dY[2]];
@@ -771,8 +783,7 @@ $("btnTray").onclick=()=>{ const t=$("tray"); t.classList.toggle("open");
 
 $("fov").oninput=e=>{ state.fovLong=+e.target.value; $("fovVal").textContent=state.fovLong.toFixed(1)+"°"; draw(); };
 $("hoff").oninput=e=>{ state.headOff=+e.target.value; $("hoffVal").textContent=state.headOff.toFixed(1)+"°"; draw(); };
-$("btnFlip").onclick=()=>{ state.flip=!state.flip; draw(); };
-$("btnReset").onclick=()=>{ state.headOff=0; state.pitchOff=0; state.fovLong=67; state.flip=false;
+$("btnReset").onclick=()=>{ state.headOff=0; state.pitchOff=0; state.fovLong=67;
   $("hoff").value=0; $("hoffVal").textContent="0°"; $("fov").value=67; $("fovVal").textContent="67°"; draw(); };
 
 const sel=$("view");
