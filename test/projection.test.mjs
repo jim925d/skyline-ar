@@ -124,5 +124,88 @@ console.log("\n-- persisted alignment survives a reload --");
   near(d.api.state.fovLong, 67, 1e-9, "corrupt storage falls back to defaults");
 }
 
+console.log("\n-- FOV calibration solvers --");
+{
+  /* Synthesise a ground truth, throw it away, and check the solver finds it again.
+     This is real verification: the calibration maths is pure and does not need a
+     phone. What it cannot tell you is whether YOU dragged the marker onto the
+     right summit -- that part is still a field test. */
+  const mk = a => { const { api, el } = load({ screenAngle: 0 });
+    el("vid").videoWidth = 1920; el("vid").videoHeight = 1080;
+    api.state.orient = { alpha: 90, beta: 90, gamma: 0 }; api.state.screenAngle = 0; return api; };
+
+  { // focalPx and fovFromFocal are exact inverses
+    const api = mk();
+    for (const fov of [42, 58.25, 67, 74, 96]) {
+      api.state.fovLong = fov;
+      near(api.fovFromFocal(api.focalPx()), fov, 1e-9, `fovFromFocal inverts focalPx at ${fov} deg`);
+    }
+  }
+
+  { // step 1: recover a known heading/pitch offset from one dragged point
+    const api = mk();
+    const peak = { n: "truth", az: 272, alt: 1.5 };
+    api.state.fovLong = 67;
+    api.state.headOff = -2.5; api.state.pitchOff = 1.2;
+    const truth = api.projectAR(api.basisFromOrientation(), api.focalPx(), peak.az, peak.alt);
+
+    api.state.headOff = 0; api.state.pitchOff = 0;
+    ok(api.solveAxis(peak, truth.x, truth.y), "solveAxis converges");
+    near(api.state.headOff, -2.5, 0.02, "heading offset recovered");
+    near(api.state.pitchOff, 1.2, 0.02, "pitch offset recovered");
+    const back = api.projectAR(api.basisFromOrientation(), api.focalPx(), peak.az, peak.alt);
+    near(back.x, truth.x, 0.1, "peak reprojects onto the dragged point (x)");
+    near(back.y, truth.y, 0.1, "peak reprojects onto the dragged point (y)");
+  }
+
+  { // step 2: recover a known FOV from one off-axis point, axis already pinned
+    const api = mk();
+    const peak = { n: "edge", az: 286, alt: 2.0 };
+    api.state.headOff = 0; api.state.pitchOff = 0;
+
+    api.state.fovLong = 74;                                   // the lens's real FOV
+    const truth = api.projectAR(api.basisFromOrientation(), api.focalPx(), peak.az, peak.alt);
+
+    api.state.fovLong = 67;                                   // the guess we ship with
+    const f0 = api.focalPx();
+    const drawn = api.projectAR(api.basisFromOrientation(), f0, peak.az, peak.alt);
+    const dx = drawn.x - 390 / 2, dy = drawn.y - 780 / 2, r0 = Math.hypot(dx, dy);
+    ok(r0 > Math.min(390, 780) * 0.15, "the chosen peak is far enough off-axis to measure scale");
+    api.state.cal = { step: 2, peak, ref: { f0, r0, ux: dx / r0, uy: dy / r0 } };
+
+    ok(api.solveFov(truth.x, truth.y), "solveFov accepts the drag");
+    near(api.state.fovLong, 74, 0.01, "field of view recovered from a single off-axis point");
+  }
+
+  { // the degeneracy that forced two steps: a centred point carries no scale information
+    const api = mk();
+    api.state.headOff = 0; api.state.pitchOff = 0; api.state.fovLong = 67;
+    const centred = { n: "middle", az: 270.1, alt: 0.05 };
+    const f0 = api.focalPx();
+    const d = api.projectAR(api.basisFromOrientation(), f0, centred.az, centred.alt);
+    const r0 = Math.hypot(d.x - 390 / 2, d.y - 780 / 2);
+    ok(r0 < Math.min(390, 780) * 0.15,
+       "a peak near the optical axis falls inside the rejection radius, as intended");
+  }
+
+  { // dragging back through the centre is refused rather than producing a wild FOV
+    const api = mk();
+    api.state.fovLong = 67;
+    api.state.cal = { step: 2, peak: { n: "x", az: 286, alt: 2 },
+                      ref: { f0: api.focalPx(), r0: 120, ux: 1, uy: 0 } };
+    ok(api.solveFov(390 / 2 - 50, 780 / 2) === false, "a drag through the centre is rejected");
+    near(api.state.fovLong, 67, 1e-9, "...and leaves the FOV untouched");
+  }
+
+  { // a solved FOV survives a reload
+    const a = load({});
+    a.sandbox.localStorage.setItem("skyline-ar.prefs.v1",
+      JSON.stringify({ fovLong: 74.2, fovCalibrated: true }));
+    a.api.loadPrefs();
+    near(a.api.state.fovLong, 74.2, 1e-9, "calibrated FOV restored on reload");
+    ok(a.api.state.fovCalibrated === true, "calibrated flag restored");
+  }
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

@@ -37,6 +37,16 @@
   #orientWarn .acts{display:flex;gap:.4rem;margin-top:.5rem}
   #orientWarn .acts button{flex:1;background:#2a1a0e;border:1px solid #a35f2a;color:#ffd9b5;
         border-radius:7px;padding:.4rem .5rem;font:inherit;font-size:.76rem}
+  #calBar{position:absolute;left:.5rem;right:.5rem;bottom:3.1rem;
+        background:rgba(9,15,22,.92);border:1px solid var(--glow);border-radius:10px;padding:.55rem .7rem;
+        font-size:.79rem;line-height:1.4;display:none;backdrop-filter:blur(10px);z-index:6}
+  #calBar b{color:var(--glow)}
+  #calBar .sub{color:var(--dim);font-size:.72rem;margin-top:.2rem}
+  #calBar .acts{display:flex;gap:.4rem;margin-top:.55rem}
+  #calBar .acts button{flex:1;background:var(--panel-2);border:1px solid var(--line);color:var(--text);
+        border-radius:7px;padding:.42rem .5rem;font:inherit;font-size:.78rem}
+  #calBar .acts button.go{background:#23425c;border-color:#3d7aa5}
+  #calBar .acts button[disabled]{opacity:.4}
   #readout{position:absolute;left:.5rem;bottom:3.3rem;max-width:min(80%,360px);
            background:rgba(9,15,22,.88);border:1px solid var(--line);border-radius:10px;padding:.55rem .7rem;
            font-size:.82rem;line-height:1.35;display:none;backdrop-filter:blur(10px)}
@@ -96,6 +106,15 @@
     </div>
   </div>
 
+  <div id="calBar">
+    <div id="calStep"></div>
+    <div class="sub" id="calHint"></div>
+    <div class="acts">
+      <button id="calCancel">Cancel</button>
+      <button id="calNext" class="go">Next</button>
+    </div>
+  </div>
+
   <div id="readout"></div>
 
   <div id="hud">
@@ -124,7 +143,11 @@
       <div class="slider-row"><input type="range" id="fov" min="40" max="90" step="0.5" value="67"><span class="val" id="fovVal">67°</span></div>
       <label for="hoff" style="margin-top:.5rem">Compass correction</label>
       <div class="slider-row"><input type="range" id="hoff" min="-30" max="30" step="0.5" value="0"><span class="val" id="hoffVal">0°</span></div>
-      <button class="btn" id="btnReset" style="margin-top:.5rem">Reset alignment</button>
+      <div class="row" style="margin-top:.5rem">
+        <button class="btn primary" id="btnCal">Calibrate FOV</button>
+        <button class="btn" id="btnReset">Reset alignment</button>
+      </div>
+      <p class="note" id="calState" style="margin-top:.4rem"></p>
       <p class="note" style="margin-top:.5rem">Easier way: tap Align, then drag the screen until the drawn ridges sit on the real ones. Sideways drag fixes the compass, up-down fixes the tilt.</p>
     </fieldset>
 
@@ -256,7 +279,7 @@ const state={
   lat:39.7392, lon:-104.9903, elev:1609, eye:1.7, label:"Denver — Civic Center",
   range:160, minAng:-0.6, units:"ft", sun:true,
   mode:"draw",                 // "camera" | "draw"
-  fovLong:67, headOff:0, pitchOff:0, fovCalibrated:false,
+  fovLong:67, headOff:0, pitchOff:0, fovCalibrated:false, cal:null,
   aligning:false, locked:false,
   orient:null,                 // {alpha,beta,gamma} degrees, north-referenced
   absoluteOk:null,             // null unknown / true north-referenced / false relative-only
@@ -419,6 +442,126 @@ function projectAR(basis,f,az,alt){
   return {x:W/2+f*cx/z2, y:H/2-f*y2/z2, z:z2};
 }
 
+/* ---------------- field-of-view calibration ---------------- */
+
+/* One dragged point cannot solve field of view. Moving a single peak is
+   explained equally well by a focal-length change or by a heading/pitch
+   offset -- the two are degenerate, and a one-point solver just fights the
+   manual alignment. So the flow is the same gesture twice:
+
+     Step 1  a peak anywhere in frame pins the optical axis. Solve headOff
+             and pitchOff so that peak lands where you put it.
+     Step 2  a peak well off to the side pins the scale. With the axis fixed,
+             a point's screen radius from centre is exactly proportional to
+             focal length -- the direction cosines in projectAR() do not
+             depend on f -- so f_new = f_old * r_wanted / r_drawn, and the
+             field of view follows from the inverse of focalPx(). */
+
+function fovFromFocal(f){
+  const vw=vid.videoWidth||W, vh=vid.videoHeight||H;
+  const long=Math.max(vw,vh), sc=Math.max(W/vw,H/vh);
+  return 2*Math.atan((long/2)*sc/f)*R2D;
+}
+
+/* Nudge headOff/pitchOff until `peak` projects onto (tx,ty).
+   The Jacobian is near-diagonal: a degree of heading moves the point about
+   f*rad horizontally, a degree of pitch about f*rad vertically. Damped, so
+   the off-axis coupling converges instead of ringing. */
+function solveAxis(peak,tx,ty){
+  const f=focalPx();
+  for(let i=0;i<80;i++){
+    const b=basisFromOrientation(); if(!b) return false;
+    const pt=projectAR(b,f,peak.az,peak.alt); if(!pt) return false;
+    const ex=tx-pt.x, ey=ty-pt.y;
+    if(Math.abs(ex)<0.05&&Math.abs(ey)<0.05) return true;
+    state.headOff =clamp(state.headOff -(ex/f)*R2D*0.85,-30,30);
+    state.pitchOff=clamp(state.pitchOff+(ey/f)*R2D*0.85,-20,20);
+  }
+  return true;
+}
+
+/* Scale focal length so the reference peak's radius from centre becomes the
+   radius the finger is at, measured along the original radial direction so a
+   sideways wobble in the drag does not leak into the answer. */
+function solveFov(tx,ty){
+  const r=state.cal&&state.cal.ref; if(!r) return false;
+  const proj=((tx-W/2)*r.ux+(ty-H/2)*r.uy);
+  if(proj<r.r0*0.2) return false;                 // dragged to or through the centre
+  state.fovLong=clamp(fovFromFocal(r.f0*proj/r.r0),30,100);
+  return true;
+}
+
+const CAL_MIN_R=()=>Math.min(W,H)*0.15;
+
+function calStart(){
+  if(state.mode!=="camera"||!basisFromOrientation()){
+    $("calState").textContent="Calibration needs the camera running and a working compass.";
+    return;
+  }
+  state.cal={step:1,peak:null,ref:null};
+  state.aligning=false; $("btnAlign").textContent="Align"; $("btnAlign").setAttribute("aria-pressed","false");
+  hideReadout();
+  $("tray").classList.remove("open"); $("btnTray").textContent="Setup"; setTimeout(resize,230);
+  $("calBar").style.display="block";
+  calPaint(); draw();
+}
+function calStop(){ state.cal=null; $("calBar").style.display="none"; calPaintState(); draw(); }
+
+function calPaint(){
+  const c=state.cal; if(!c) return;
+  const step=$("calStep"), hint=$("calHint"), next=$("calNext");
+  if(c.step===1){
+    step.innerHTML=c.peak?`<b>Step 1 of 2 — ${c.peak.n}</b>`:"<b>Step 1 of 2 — pin the centre</b>";
+    hint.textContent=c.peak
+      ? "Drag so the marker sits on the real summit. This sets heading and pitch."
+      : "Tap a peak you can identify on the skyline.";
+    next.textContent="Next"; next.disabled=!c.peak;
+  }else{
+    step.innerHTML=c.peak?`<b>Step 2 of 2 — ${c.peak.n}</b>`:"<b>Step 2 of 2 — pin the scale</b>";
+    hint.textContent=c.peak
+      ? `Drag it onto its real summit. Field of view ${state.fovLong.toFixed(1)}°.`
+      : "Now tap a different peak, well out toward the edge of the frame.";
+    next.textContent="Done"; next.disabled=!c.ref;
+  }
+}
+function calPaintState(){
+  $("calState").textContent=state.fovCalibrated
+    ? `Field of view solved by calibration: ${state.fovLong.toFixed(1)}°.`
+    : `Field of view ${state.fovLong.toFixed(1)}° — a guess at the main wide lens, not calibrated.`;
+}
+
+/* tap during calibration */
+function calPick(peak){
+  const c=state.cal, b=basisFromOrientation(); if(!c||!b) return;
+  const f=focalPx(), pt=projectAR(b,f,peak.az,peak.alt);
+  if(!pt) return;
+  if(c.step===2){
+    const dx=pt.x-W/2, dy=pt.y-H/2, r0=Math.hypot(dx,dy);
+    if(c.first&&peak.n===c.first){ $("calHint").textContent="Pick a different peak from the one in step 1."; return; }
+    if(r0<CAL_MIN_R()){
+      $("calHint").textContent="Too near the middle to measure scale — aim so the peak sits out toward the edge.";
+      return;
+    }
+    c.ref={f0:f,r0,ux:dx/r0,uy:dy/r0};
+  }
+  c.peak=peak; calPaint(); draw();
+}
+
+/* drag during calibration */
+function calDrag(x,y){
+  const c=state.cal; if(!c||!c.peak) return;
+  if(c.step===1) solveAxis(c.peak,x,y); else solveFov(x,y);
+  savePrefs(); calPaint(); draw();
+}
+
+$("btnCal").onclick=calStart;
+$("calCancel").onclick=calStop;
+$("calNext").onclick=()=>{
+  const c=state.cal; if(!c) return;
+  if(c.step===1){ c.first=c.peak?c.peak.n:null; c.step=2; c.peak=null; c.ref=null; calPaint(); draw(); }
+  else{ state.fovCalibrated=true; savePrefs(); calStop(); }
+};
+
 /* ---------------- drawing ---------------- */
 
 function draw(){
@@ -477,6 +620,8 @@ function drawAR(){
 
   labelsAR(vis);
 
+  if(state.cal) drawCalibration(basis,f);
+
   if(state.aligning){
     ctx.strokeStyle="rgba(255,157,92,.8)"; ctx.lineWidth=1;
     ctx.setLineDash([6,6]);
@@ -486,6 +631,26 @@ function drawAR(){
     ctx.fillText(`drag to align · ${state.headOff>=0?"+":""}${state.headOff.toFixed(1)}° / ${state.pitchOff>=0?"+":""}${state.pitchOff.toFixed(1)}°`, W/2, H-14);
     ctx.textAlign="left";
   }
+}
+
+function drawCalibration(basis,f){
+  const c=state.cal;
+  ctx.strokeStyle="rgba(255,157,92,.35)"; ctx.lineWidth=1; ctx.setLineDash([4,7]);
+  ctx.beginPath(); ctx.moveTo(W/2,0); ctx.lineTo(W/2,H); ctx.moveTo(0,H/2); ctx.lineTo(W,H/2); ctx.stroke();
+  ctx.setLineDash([]);
+  if(c.step===2){
+    ctx.strokeStyle="rgba(255,157,92,.22)";
+    ctx.beginPath(); ctx.arc(W/2,H/2,CAL_MIN_R(),0,7); ctx.stroke();
+  }
+  if(!c.peak) return;
+  const pt=projectAR(basis,f,c.peak.az,c.peak.alt); if(!pt) return;
+  ctx.strokeStyle="#ff9d5c"; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.arc(pt.x,pt.y,26,0,7); ctx.stroke();
+  ctx.beginPath(); ctx.arc(pt.x,pt.y,3,0,7); ctx.fillStyle="#ff9d5c"; ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(pt.x-38,pt.y); ctx.lineTo(pt.x-30,pt.y); ctx.moveTo(pt.x+30,pt.y); ctx.lineTo(pt.x+38,pt.y);
+  ctx.moveTo(pt.x,pt.y-38); ctx.lineTo(pt.x,pt.y-30); ctx.moveTo(pt.x,pt.y+30); ctx.lineTo(pt.x,pt.y+38);
+  ctx.stroke();
 }
 
 function headingNow(basis){
@@ -785,6 +950,11 @@ cv.addEventListener("pointermove",e=>{
     draw(); return;
   }
   if(pointers.size!==1) return;
+  if(state.cal&&state.mode==="camera"){
+    const r=cv.getBoundingClientRect();
+    calDrag(e.clientX-r.left,e.clientY-r.top);
+    return;
+  }
   if(state.mode==="camera"){
     if(!state.aligning) return;
     const degPerPx=state.fovLong/Math.max(W,H);
@@ -825,6 +995,7 @@ function pick(cx,cy){
     const d=Math.hypot(p._x-x,p._y-y);
     if(d<bd){bd=d;best=p;}
   }
+  if(state.cal){ if(best&&bd<70) calPick(best); return; }
   if(best&&bd<52) showReadout(best); else hideReadout();
 }
 
@@ -875,12 +1046,12 @@ $("btnTray").onclick=()=>{ const t=$("tray"); t.classList.toggle("open");
   $("btnTray").textContent=t.classList.contains("open")?"Done":"Setup"; setTimeout(resize,230); };
 
 $("fov").oninput=e=>{ state.fovLong=+e.target.value; state.fovCalibrated=false;
-  $("fovVal").textContent=state.fovLong.toFixed(1)+"°"; savePrefs(); draw(); };
+  $("fovVal").textContent=state.fovLong.toFixed(1)+"°"; savePrefs(); calPaintState(); draw(); };
 $("hoff").oninput=e=>{ state.headOff=+e.target.value; $("hoffVal").textContent=state.headOff.toFixed(1)+"°";
   savePrefs(); draw(); };
 $("btnReset").onclick=()=>{ state.headOff=0; state.pitchOff=0; state.fovLong=67; state.fovCalibrated=false;
   $("hoff").value=0; $("hoffVal").textContent="0°"; $("fov").value=67; $("fovVal").textContent="67°";
-  clearPrefs(); draw(); };
+  clearPrefs(); calPaintState(); if(state.cal) calStop(); else draw(); };
 
 const sel=$("view");
 VIEWS.forEach((v,i)=>{const o=document.createElement("option");o.value=i;o.textContent=v[0];sel.appendChild(o);});
@@ -962,6 +1133,7 @@ $("btnPaste").onclick=()=>{
 function refresh(){ compute(); draw(); }
 
 function syncPrefControls(){
+  calPaintState();
   $("fov").value=state.fovLong.toFixed(1);   $("fovVal").textContent=state.fovLong.toFixed(1)+"°";
   $("hoff").value=state.headOff.toFixed(1);  $("hoffVal").textContent=state.headOff.toFixed(1)+"°";
   $("range").value=state.range;              $("rangeVal").textContent=state.range+" km";
