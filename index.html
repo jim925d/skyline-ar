@@ -30,6 +30,13 @@
   .pill:active{opacity:.7}
   #where{font-size:.7rem;color:var(--dim);line-height:1.25;background:rgba(9,15,22,.7);
          border-radius:8px;padding:.3rem .5rem;backdrop-filter:blur(10px);margin-left:auto;text-align:right}
+  #orientWarn{position:absolute;left:.5rem;right:.5rem;top:calc(3.1rem + env(safe-area-inset-top));
+        background:rgba(60,28,10,.94);border:1px solid #a35f2a;border-radius:10px;padding:.55rem .7rem;
+        font-size:.78rem;line-height:1.4;display:none;backdrop-filter:blur(10px);z-index:5}
+  #orientWarn b{color:#ffbe8a}
+  #orientWarn .acts{display:flex;gap:.4rem;margin-top:.5rem}
+  #orientWarn .acts button{flex:1;background:#2a1a0e;border:1px solid #a35f2a;color:#ffd9b5;
+        border-radius:7px;padding:.4rem .5rem;font:inherit;font-size:.76rem}
   #readout{position:absolute;left:.5rem;bottom:3.3rem;max-width:min(80%,360px);
            background:rgba(9,15,22,.88);border:1px solid var(--line);border-radius:10px;padding:.55rem .7rem;
            font-size:.82rem;line-height:1.35;display:none;backdrop-filter:blur(10px)}
@@ -77,6 +84,16 @@
     <button class="pill" id="btnMode" aria-pressed="true">Camera</button>
     <button class="pill" id="btnAlign">Align</button>
     <div id="where">—</div>
+  </div>
+
+  <div id="orientWarn">
+    <b>This phone's compass isn't north-referenced.</b>
+    It reports relative orientation only, so the overlay would drift away from the real skyline with no
+    warning. Switched to the drawn panorama, which doesn't need a compass.
+    <div class="acts">
+      <button id="warnStay">Stay in drawing mode</button>
+      <button id="warnCamera">Use the camera anyway</button>
+    </div>
   </div>
 
   <div id="readout"></div>
@@ -242,6 +259,8 @@ const state={
   fovLong:67, headOff:0, pitchOff:0, fovCalibrated:false,
   aligning:false, locked:false,
   orient:null,                 // {alpha,beta,gamma} degrees, north-referenced
+  absoluteOk:null,             // null unknown / true north-referenced / false relative-only
+  sawOrientation:false, nonAbsoluteHandled:false, absoluteOverride:false, _absTimer:null,
   screenAngle:0,
   drawAz:270, drawAlt:2.2, drawFov:90,
   peaks:PEAKS.slice(), visible:[], selected:null
@@ -418,6 +437,12 @@ function drawAR(){
     return;
   }
   const f=focalPx();
+
+  if(state.absoluteOk===false&&state.absoluteOverride){
+    ctx.fillStyle="rgba(120,60,16,.8)"; ctx.fillRect(0,0,W,20);
+    ctx.fillStyle="#ffd9b5"; ctx.font="500 11px ui-sans-serif,sans-serif"; ctx.textAlign="center";
+    ctx.fillText("relative compass — heading is not trustworthy",W/2,14); ctx.textAlign="left";
+  }
 
   if(state.sun) drawSunAR(basis,f);
 
@@ -653,17 +678,47 @@ async function askMotion(){
       if(r!=="granted") return false;
     }
   }catch(e){ return false; }
-  orientHandler=ev=>{
+  /* Absolute vs relative orientation.
+     iOS exposes webkitCompassHeading, which is true-north referenced.
+     Android should fire deviceorientationabsolute, or set ev.absolute on
+     deviceorientation. Some handsets do neither and quietly hand back a
+     relative frame whose alpha starts wherever the page happened to load --
+     the overlay then looks plausible and is wrong by an arbitrary amount.
+     Detect that and say so rather than drawing a confident lie. */
+  const makeHandler=fromAbsoluteEvent=>ev=>{
     if(ev.alpha==null&&ev.webkitCompassHeading==null) return;
-    let alpha=ev.alpha;
-    if(typeof ev.webkitCompassHeading==="number") alpha=360-ev.webkitCompassHeading;  // iOS: true north
-    else if(!ev.absolute && !state._warned){ state._warned=true; }
+    let alpha=ev.alpha, absolute=fromAbsoluteEvent||ev.absolute===true;
+    if(typeof ev.webkitCompassHeading==="number"){ alpha=360-ev.webkitCompassHeading; absolute=true; }
+    state.sawOrientation=true;
+    if(absolute) state.absoluteOk=true;
+    else if(state.absoluteOk===null) state.absoluteOk=false;
     state.orient={alpha:alpha||0, beta:ev.beta||0, gamma:ev.gamma||0};
   };
-  window.addEventListener("deviceorientationabsolute",orientHandler,true);
-  window.addEventListener("deviceorientation",orientHandler,true);
+  window.addEventListener("deviceorientationabsolute",makeHandler(true),true);
+  window.addEventListener("deviceorientation",makeHandler(false),true);
+
+  /* Give the absolute listener a couple of seconds to win before deciding. */
+  clearTimeout(state._absTimer);
+  state._absTimer=setTimeout(()=>{
+    if(state.sawOrientation&&state.absoluteOk!==true) failNonAbsolute();
+  },2500);
   return true;
 }
+
+function failNonAbsolute(){
+  if(state.nonAbsoluteHandled) return;
+  state.nonAbsoluteHandled=true;
+  state.mode="draw"; setModeUI();
+  $("orientWarn").style.display="block";
+  refresh();
+}
+$("warnStay").onclick=()=>{ $("orientWarn").style.display="none"; };
+$("warnCamera").onclick=async()=>{
+  $("orientWarn").style.display="none";
+  state.absoluteOverride=true;
+  if(!vid.srcObject){ const ok=await startCamera(); if(!ok) return; }
+  state.mode="camera"; setModeUI(); startLoop(); draw();
+};
 
 async function startCamera(){
   const warn=$("gateWarn");
