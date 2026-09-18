@@ -1,0 +1,865 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no">
+<title>Skyline AR — peaks through the camera</title>
+<style>
+  :root{
+    --ink:#0a1016; --panel:#0f1720; --panel-2:#16212c; --line:#26374a;
+    --text:#e6edf3; --dim:#93a7b8; --glow:#ff9d5c;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;height:100%;overflow:hidden;background:#000;}
+  body{
+    font-family:ui-sans-serif,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    color:var(--text);display:flex;flex-direction:column;
+  }
+  #stage{position:relative;flex:1;min-height:0;touch-action:none;overflow:hidden;background:#05080c}
+  #vid{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:none;background:#000}
+  #c{position:absolute;inset:0;width:100%;height:100%}
+  #hud{position:absolute;left:0;right:0;bottom:0;padding:.55rem;padding-bottom:calc(.55rem + env(safe-area-inset-bottom));
+       display:flex;gap:.4rem;align-items:flex-end;flex-wrap:wrap;pointer-events:none}
+  #hud>*{pointer-events:auto}
+  #topbar{position:absolute;left:0;right:0;top:0;padding:calc(.5rem + env(safe-area-inset-top)) .6rem .5rem;
+          display:flex;gap:.4rem;align-items:center;pointer-events:none}
+  #topbar>*{pointer-events:auto}
+  .pill{background:rgba(9,15,22,.78);border:1px solid var(--line);color:var(--text);border-radius:999px;
+        padding:.42rem .72rem;font-size:.78rem;backdrop-filter:blur(10px);white-space:nowrap}
+  .pill[aria-pressed="true"]{background:#23425c;border-color:#3d7aa5}
+  .pill:active{opacity:.7}
+  #where{font-size:.7rem;color:var(--dim);line-height:1.25;background:rgba(9,15,22,.7);
+         border-radius:8px;padding:.3rem .5rem;backdrop-filter:blur(10px);margin-left:auto;text-align:right}
+  #readout{position:absolute;left:.5rem;bottom:3.3rem;max-width:min(80%,360px);
+           background:rgba(9,15,22,.88);border:1px solid var(--line);border-radius:10px;padding:.55rem .7rem;
+           font-size:.82rem;line-height:1.35;display:none;backdrop-filter:blur(10px)}
+  #readout b{font-size:.94rem}
+  #readout .sub{color:var(--dim);font-size:.74rem;margin-top:.12rem}
+  #readout .close{float:right;color:var(--dim);padding:0 .25rem}
+  #gate{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;gap:.8rem;
+        padding:1.6rem;background:linear-gradient(#0a1626,#16303f);text-align:left}
+  #gate h1{font-size:1.4rem;margin:0;font-weight:600;letter-spacing:-.01em}
+  #gate p{margin:0;font-size:.86rem;color:var(--dim);line-height:1.5;max-width:34ch}
+  #gate .warn{font-size:.76rem;color:#ffbe8a}
+  #tray{background:var(--panel);border-top:1px solid var(--line);max-height:0;overflow:hidden;transition:max-height .2s ease}
+  #tray.open{max-height:58vh;overflow-y:auto}
+  .tray-inner{padding:.8rem .9rem calc(1.2rem + env(safe-area-inset-bottom));display:grid;gap:.8rem}
+  fieldset{border:1px solid var(--line);border-radius:10px;margin:0;padding:.55rem .7rem .75rem}
+  legend{font-size:.72rem;color:var(--dim);padding:0 .35rem}
+  label{font-size:.76rem;color:var(--dim);display:block;margin-bottom:.2rem}
+  input,select,textarea{width:100%;background:var(--panel-2);border:1px solid var(--line);color:var(--text);
+        border-radius:8px;padding:.48rem .55rem;font:inherit;font-size:.85rem}
+  textarea{min-height:70px;font-size:.74rem;font-family:ui-monospace,Menlo,monospace}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:.5rem}
+  .row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:.5rem}
+  .btn{background:var(--panel-2);border:1px solid var(--line);color:var(--text);border-radius:8px;
+       padding:.55rem .7rem;font-size:.82rem;width:100%}
+  .btn.primary{background:#23425c;border-color:#3d7aa5}
+  .btn:active{opacity:.75}
+  .slider-row{display:flex;align-items:center;gap:.6rem}
+  .slider-row input[type=range]{flex:1;padding:0}
+  .val{font-size:.75rem;color:var(--dim);min-width:4.4rem;text-align:right}
+  .peaklist{display:grid;gap:1px;background:var(--line);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+  .peaklist button{display:flex;gap:.6rem;align-items:baseline;background:var(--panel-2);border:0;color:var(--text);
+        padding:.5rem .6rem;text-align:left;font:inherit;font-size:.82rem;width:100%}
+  .peaklist button .d{margin-left:auto;color:var(--dim);font-size:.73rem;white-space:nowrap}
+  .note{font-size:.72rem;color:var(--dim);line-height:1.45}
+  :focus-visible{outline:2px solid var(--glow);outline-offset:2px}
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <video id="vid" playsinline muted autoplay></video>
+  <canvas id="c"></canvas>
+
+  <div id="topbar">
+    <button class="pill" id="btnMode" aria-pressed="true">Camera</button>
+    <button class="pill" id="btnAlign">Align</button>
+    <div id="where">—</div>
+  </div>
+
+  <div id="readout"></div>
+
+  <div id="hud">
+    <button class="pill" id="btnSun" aria-pressed="true">Sun</button>
+    <button class="pill" id="btnUnits">ft</button>
+    <button class="pill" id="btnLock">Lock heading</button>
+    <button class="pill" id="btnTray" style="margin-left:auto">Setup</button>
+  </div>
+
+  <div id="gate">
+    <h1>Skyline AR</h1>
+    <p>Hold the phone up and the peaks on the horizon get named, drawn over the live camera.</p>
+    <p>It needs the camera, the compass and your location. Nothing leaves the phone.</p>
+    <button class="btn primary" id="btnStart" style="max-width:20rem">Start camera</button>
+    <button class="btn" id="btnSkip" style="max-width:20rem">Skip — use the drawn panorama</button>
+    <p class="warn" id="gateWarn"></p>
+  </div>
+</div>
+
+<div id="tray">
+  <div class="tray-inner">
+
+    <fieldset>
+      <legend>Alignment</legend>
+      <label for="fov">Camera field of view</label>
+      <div class="slider-row"><input type="range" id="fov" min="40" max="90" step="0.5" value="67"><span class="val" id="fovVal">67°</span></div>
+      <label for="hoff" style="margin-top:.5rem">Compass correction</label>
+      <div class="slider-row"><input type="range" id="hoff" min="-30" max="30" step="0.5" value="0"><span class="val" id="hoffVal">0°</span></div>
+      <div class="row" style="margin-top:.5rem">
+        <button class="btn" id="btnFlip">Flip landscape</button>
+        <button class="btn" id="btnReset">Reset alignment</button>
+      </div>
+      <p class="note" style="margin-top:.5rem">Easier way: tap Align, then drag the screen until the drawn ridges sit on the real ones. Sideways drag fixes the compass, up-down fixes the tilt.</p>
+    </fieldset>
+
+    <fieldset>
+      <legend>Where you're standing</legend>
+      <label for="view">Saved viewpoints</label>
+      <select id="view"></select>
+      <div class="row3" style="margin-top:.5rem">
+        <div><label for="lat">Latitude</label><input id="lat" inputmode="decimal"></div>
+        <div><label for="lon">Longitude</label><input id="lon" inputmode="decimal"></div>
+        <div><label for="elev">Elevation (m)</label><input id="elev" inputmode="decimal"></div>
+      </div>
+      <div class="row" style="margin-top:.5rem">
+        <button class="btn" id="btnGeo">Use my location</button>
+        <button class="btn primary" id="btnApply">Apply</button>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>What to draw</legend>
+      <div class="slider-row"><input type="range" id="range" min="20" max="300" step="10" value="160"><span class="val" id="rangeVal">160 km</span></div>
+      <div class="slider-row" style="margin-top:.4rem"><input type="range" id="minang" min="-2" max="3" step="0.1" value="-0.6"><span class="val" id="minangVal">-0.6°</span></div>
+      <p class="note">Range to look, and the lowest angle above your eye line worth drawing.</p>
+    </fieldset>
+
+    <fieldset>
+      <legend>Peaks in view</legend>
+      <div class="peaklist" id="plist"></div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Load peaks for anywhere</legend>
+      <p class="note">Built-in peaks cover Colorado. Anywhere else, pull summits from OpenStreetMap.</p>
+      <button class="btn" id="btnOsm" style="margin-top:.5rem">Load peaks near this viewpoint</button>
+      <div id="osmFallback" style="display:none;margin-top:.5rem">
+        <p class="note">Blocked here. Open this on any device and paste the response back.</p>
+        <input id="osmUrl" readonly style="margin-top:.4rem">
+        <textarea id="osmPaste" placeholder="Paste the JSON here" style="margin-top:.4rem"></textarea>
+        <button class="btn" id="btnPaste" style="margin-top:.4rem">Add pasted peaks</button>
+      </div>
+      <p class="note" id="osmStatus" style="margin-top:.5rem"></p>
+    </fieldset>
+
+    <p class="note">Ridge outlines are built from summit points rather than elevation tiles, so the line between
+    peaks is approximate. Bearings, distances and heights above the horizon are computed properly, including
+    earth curvature and refraction.</p>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+/* ---------------- peak + viewpoint data ---------------- */
+
+const PEAKS = [
+  ["Longs Peak",40.2549,-105.6151,4346],["Mount Meeker",40.2361,-105.6267,4240],
+  ["Chiefs Head Peak",40.2306,-105.6606,4139],["Pagoda Mountain",40.2444,-105.6408,4090],
+  ["McHenrys Peak",40.2503,-105.6739,4062],["Mount Alice",40.1908,-105.6653,4090],
+  ["Twin Sisters Peaks",40.2908,-105.5361,3483],["Ypsilon Mountain",40.4661,-105.6614,4119],
+  ["Hagues Peak",40.4869,-105.6497,4114],["Mummy Mountain",40.4250,-105.6600,4003],
+  ["Mount Chapin",40.4406,-105.6764,3891],
+  ["Mount Audubon",40.0783,-105.6300,4031],["Sawtooth Mountain",40.0872,-105.6431,3898],
+  ["Mount Toll",40.0672,-105.6444,3956],["Pawnee Peak",40.0711,-105.6469,3961],
+  ["Shoshoni Peak",40.0594,-105.6444,3993],["Apache Peak",40.0533,-105.6478,4079],
+  ["Navajo Peak",40.0486,-105.6444,4087],["North Arapaho Peak",40.0464,-105.6444,4116],
+  ["South Arapaho Peak",40.0400,-105.6417,4055],["Mount Neva",40.0025,-105.6483,3972],
+  ["James Peak",39.8683,-105.6775,4052],["Parry Peak",39.8358,-105.7147,4081],
+  ["Mount Bancroft",39.8503,-105.6900,4024],["Mount Eva",39.8300,-105.6950,4009],
+  ["Mount Flora",39.8003,-105.7128,4014],["Byers Peak",39.9078,-105.9297,3902],
+  ["Mount Blue Sky",39.5883,-105.6438,4348],["Mount Bierstadt",39.5827,-105.6686,4287],
+  ["Mount Spalding",39.5975,-105.6553,4232],["Mount Rosalie",39.5542,-105.6014,4021],
+  ["Grays Peak",39.6339,-105.8175,4352],["Torreys Peak",39.6428,-105.8210,4349],
+  ["Mount Sniktau",39.6789,-105.8494,4045],["Chief Mountain",39.6431,-105.6006,3563],
+  ["Squaw Mountain",39.6811,-105.4936,3494],["Bergen Peak",39.6667,-105.4167,2951],
+  ["Mount Morrison",39.6583,-105.1936,2394],["Green Mountain (Lakewood)",39.6817,-105.1594,2094],
+  ["Lookout Mountain",39.7325,-105.2394,2286],["Mount Falcon",39.6486,-105.2333,2372],
+  ["North Table Mountain",39.7900,-105.2250,1996],["South Table Mountain",39.7500,-105.2100,1930],
+  ["Bear Peak",39.9575,-105.2997,2579],["South Boulder Peak",39.9500,-105.3028,2606],
+  ["Green Mountain (Boulder)",39.9825,-105.3117,2482],["Mount Sanitas",40.0247,-105.3036,2092],
+  ["Pikes Peak",38.8409,-105.0442,4302],["Mount Herman",39.0972,-104.9556,2762],
+  ["Devils Head",39.2633,-105.1047,2865],
+  ["Quandary Peak",39.3972,-106.1064,4348],["Mount Lincoln",39.3514,-106.1114,4356],
+  ["Mount Bross",39.3350,-106.1075,4320],["Mount Elbert",39.1178,-106.4453,4401],
+  ["Mount Massive",39.1875,-106.4757,4398],["Mount of the Holy Cross",39.4667,-106.4817,4269]
+].map(p=>({n:p[0],lat:p[1],lon:p[2],e:p[3]}));
+
+const VIEWS = [
+  ["Denver — Civic Center",39.7392,-104.9903,1609],
+  ["Denver — Sloan's Lake",39.7500,-105.0450,1620],
+  ["Boulder — Chautauqua",39.9990,-105.2820,1750],
+  ["Golden — Lookout Mountain",39.7325,-105.2394,2286],
+  ["Estes Park",40.3772,-105.5217,2300],
+  ["Colorado Springs — Garden of the Gods",38.8783,-104.8697,1950],
+  ["Summit of Mount Blue Sky",39.5883,-105.6438,4348]
+];
+
+/* ---------------- geodesy ---------------- */
+
+const R=6371000, KREF=0.13, D2R=Math.PI/180, R2D=180/Math.PI;
+const dist=(la1,lo1,la2,lo2)=>{
+  const p1=la1*D2R,p2=la2*D2R,dp=(la2-la1)*D2R,dl=(lo2-lo1)*D2R;
+  const a=Math.sin(dp/2)**2+Math.cos(p1)*Math.cos(p2)*Math.sin(dl/2)**2;
+  return 2*R*Math.asin(Math.min(1,Math.sqrt(a)));
+};
+const bearing=(la1,lo1,la2,lo2)=>{
+  const p1=la1*D2R,p2=la2*D2R,dl=(lo2-lo1)*D2R;
+  return (Math.atan2(Math.sin(dl)*Math.cos(p2),
+    Math.cos(p1)*Math.sin(p2)-Math.sin(p1)*Math.cos(p2)*Math.cos(dl))*R2D+360)%360;
+};
+const apparentAlt=(d,h,h0)=>Math.atan2((h-h0)-d*d*(1-KREF)/(2*R), d)*R2D;
+const angDiff=(a,b)=>(a-b+540)%360-180;
+
+function sunPos(date,lat,lon){
+  const n=date/86400000+2440587.5-2451545.0;
+  const L=(280.460+0.9856474*n)%360, g=((357.528+0.9856003*n)%360)*D2R;
+  const lam=(L+1.915*Math.sin(g)+0.020*Math.sin(2*g))*D2R, eps=(23.439-0.0000004*n)*D2R;
+  const ra=Math.atan2(Math.cos(eps)*Math.sin(lam),Math.cos(lam));
+  const dec=Math.asin(Math.sin(eps)*Math.sin(lam));
+  const gmst=(18.697374558+24.06570982441908*n)%24;
+  const ha=(gmst*15+lon)*D2R-ra, p=lat*D2R;
+  const alt=Math.asin(Math.sin(p)*Math.sin(dec)+Math.cos(p)*Math.cos(dec)*Math.cos(ha));
+  let az=Math.atan2(Math.sin(ha),Math.cos(ha)*Math.sin(p)-Math.tan(dec)*Math.cos(p))*R2D+180;
+  return {az:(az+360)%360, alt:alt*R2D};
+}
+
+/* ---------------- state ---------------- */
+
+const state={
+  lat:39.7392, lon:-104.9903, elev:1609, eye:1.7, label:"Denver — Civic Center",
+  range:160, minAng:-0.6, units:"ft", sun:true,
+  mode:"draw",                 // "camera" | "draw"
+  fovLong:67, headOff:0, pitchOff:0, flip:false,
+  aligning:false, locked:false,
+  orient:null,                 // {alpha,beta,gamma} degrees, north-referenced
+  screenAngle:0,
+  drawAz:270, drawAlt:2.2, drawFov:90,
+  peaks:PEAKS.slice(), visible:[], selected:null
+};
+
+const $=id=>document.getElementById(id);
+const cv=$("c"), ctx=cv.getContext("2d"), vid=$("vid");
+let W=0,H=0,DPR=1;
+
+function resize(){
+  const r=cv.parentElement.getBoundingClientRect();
+  DPR=Math.min(window.devicePixelRatio||1,2.5);
+  W=Math.round(r.width); H=Math.round(r.height);
+  cv.width=W*DPR; cv.height=H*DPR; ctx.setTransform(DPR,0,0,DPR,0,0);
+  state.screenAngle=(screen.orientation&&screen.orientation.angle)||window.orientation||0;
+  draw();
+}
+window.addEventListener("resize",resize);
+window.addEventListener("orientationchange",()=>setTimeout(resize,250));
+
+/* ---------------- peak computation ---------------- */
+
+const baseRadius=d=>Math.max(700,d*0.11);
+
+function compute(){
+  const h0=state.elev+state.eye, maxD=state.range*1000, out=[];
+  for(const p of state.peaks){
+    const d=dist(state.lat,state.lon,p.lat,p.lon);
+    if(d>maxD||d<60) continue;
+    const alt=apparentAlt(d,p.e,h0);
+    if(alt<state.minAng) continue;
+    out.push({...p,d,az:bearing(state.lat,state.lon,p.lat,p.lon),alt});
+  }
+  out.sort((a,b)=>a.d-b.d);
+  const BINS=2880, bin=360/BINS, sky=new Float32Array(BINS).fill(-90);
+  for(const p of out){
+    const halfW=R2D*Math.atan2(baseRadius(p.d),p.d);
+    const c=Math.floor(p.az/bin);
+    p.vis=p.alt>sky[c]+0.02;
+    p.halfW=halfW;
+    let i=Math.floor(((p.az-halfW+360)%360)/bin);
+    const i1=Math.floor(((p.az+halfW+360)%360)/bin);
+    for(let k=0;k<BINS;k++){
+      const frac=Math.abs(angDiff(i*bin,p.az))/Math.max(halfW,1e-6);
+      const h=p.alt*(1-Math.min(1,frac)**1.6);
+      if(h>sky[i]) sky[i]=h;
+      if(i===i1) break;
+      i=(i+1)%BINS;
+    }
+    // ridge polyline for the camera overlay
+    const pts=[];
+    for(let k=-6;k<=6;k++){
+      const f=k/6;
+      pts.push({az:p.az+f*halfW, alt:p.alt*(1-Math.abs(f)**1.6)});
+    }
+    p.ridge=pts;
+  }
+  state.visible=out;
+  paintList();
+  if(state.mode==="draw"){
+    const v=out.filter(p=>p.vis);
+    state.drawAlt=v.length?Math.max(1.2,Math.max(...v.map(p=>p.alt))*0.45):1.5;
+  }
+}
+
+/* ---------------- orientation → camera basis ---------------- */
+
+function basisFromOrientation(){
+  const o=state.orient;
+  if(!o) return null;
+  const x=o.beta*D2R, y=o.gamma*D2R, z=o.alpha*D2R;
+  const cX=Math.cos(x),cY=Math.cos(y),cZ=Math.cos(z),sX=Math.sin(x),sY=Math.sin(y),sZ=Math.sin(z);
+  // device axes expressed in world frame (X east, Y north, Z up)
+  const dX=[cZ*cY-sZ*sX*sY, cY*sZ+cZ*sX*sY, -cX*sY];
+  const dY=[-cX*sZ,         cZ*cX,           sX    ];
+  const dZ=[cY*sZ*sX+cZ*sY, sZ*sY-cZ*cY*sX,  cX*cY ];
+  let a=(state.screenAngle||0)*D2R;
+  if(state.flip) a=-a;
+  const ca=Math.cos(a), sa=Math.sin(a);
+  const right=[ca*dX[0]-sa*dY[0], ca*dX[1]-sa*dY[1], ca*dX[2]-sa*dY[2]];
+  const up   =[sa*dX[0]+ca*dY[0], sa*dX[1]+ca*dY[1], sa*dX[2]+ca*dY[2]];
+  const fwd  =[-dZ[0],-dZ[1],-dZ[2]];   // rear camera looks along -deviceZ
+  return {right,up,fwd};
+}
+
+const dot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+
+function worldVec(az,alt){
+  const a=az*D2R+ -state.headOff*D2R, e=alt*D2R;
+  return [Math.cos(e)*Math.sin(a), Math.cos(e)*Math.cos(a), Math.sin(e)];
+}
+
+function focalPx(){
+  const vw=vid.videoWidth||W, vh=vid.videoHeight||H;
+  const long=Math.max(vw,vh);
+  const f=(long/2)/Math.tan(state.fovLong*D2R/2);
+  const s=Math.max(W/vw,H/vh);      // object-fit: cover
+  return f*s;
+}
+
+/* project a bearing/altitude onto the screen; null if behind the camera */
+function projectAR(basis,f,az,alt){
+  const v=worldVec(az,alt);
+  let cx=dot(v,basis.right), cy=dot(v,basis.up), cz=dot(v,basis.fwd);
+  const p=state.pitchOff*D2R, cp=Math.cos(p), sp=Math.sin(p);
+  const y2=cy*cp-cz*sp, z2=cy*sp+cz*cp;
+  if(z2<=0.02) return null;
+  return {x:W/2+f*cx/z2, y:H/2-f*y2/z2, z:z2};
+}
+
+/* ---------------- drawing ---------------- */
+
+function draw(){
+  if(!W) return;
+  ctx.clearRect(0,0,W,H);
+  if(state.mode==="camera") drawAR(); else drawPanorama();
+  drawTapTargets();
+}
+
+function drawAR(){
+  const basis=basisFromOrientation();
+  if(!basis){
+    ctx.fillStyle="rgba(9,15,22,.7)"; ctx.fillRect(0,H/2-26,W,52);
+    ctx.fillStyle="#e6edf3"; ctx.font="500 14px ui-sans-serif,-apple-system,sans-serif";
+    ctx.textAlign="center"; ctx.fillText("Waiting for the compass…",W/2,H/2+5); ctx.textAlign="left";
+    return;
+  }
+  const f=focalPx();
+
+  if(state.sun) drawSunAR(basis,f);
+
+  const vis=state.visible.filter(p=>p.vis);
+  // horizon line
+  ctx.strokeStyle="rgba(180,215,240,.25)"; ctx.lineWidth=1;
+  ctx.beginPath(); let started=false;
+  for(let a=-90;a<=90;a+=3){
+    const az=(headingNow(basis)+a+360)%360;
+    const pt=projectAR(basis,f,az,0);
+    if(!pt||pt.x<-200||pt.x>W+200){started=false;continue;}
+    started?ctx.lineTo(pt.x,pt.y):(ctx.moveTo(pt.x,pt.y),started=true);
+  }
+  ctx.stroke();
+
+  // ridge outlines, far to near
+  for(const p of state.visible.slice().sort((a,b)=>b.d-a.d)){
+    const t=Math.min(1,p.d/(state.range*1000));
+    ctx.strokeStyle=p.vis?`rgba(140,205,245,${0.65-0.35*t})`:`rgba(140,175,205,${0.18})`;
+    ctx.lineWidth=p.vis?1.6:1;
+    ctx.beginPath(); let go=false, any=false;
+    for(const q of p.ridge){
+      const pt=projectAR(basis,f,q.az,q.alt);
+      if(!pt||pt.x<-400||pt.x>W+400){go=false;continue;}
+      any=true;
+      go?ctx.lineTo(pt.x,pt.y):(ctx.moveTo(pt.x,pt.y),go=true);
+    }
+    if(any) ctx.stroke();
+    const apex=projectAR(basis,f,p.az,p.alt);
+    p._x=apex?apex.x:undefined; p._y=apex?apex.y:undefined; p._on=!!apex;
+  }
+
+  labelsAR(vis);
+
+  if(state.aligning){
+    ctx.strokeStyle="rgba(255,157,92,.8)"; ctx.lineWidth=1;
+    ctx.setLineDash([6,6]);
+    ctx.beginPath(); ctx.moveTo(W/2,0); ctx.lineTo(W/2,H); ctx.moveTo(0,H/2); ctx.lineTo(W,H/2); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle="rgba(255,157,92,.95)"; ctx.font="500 12px ui-sans-serif,sans-serif"; ctx.textAlign="center";
+    ctx.fillText(`drag to align · ${state.headOff>=0?"+":""}${state.headOff.toFixed(1)}° / ${state.pitchOff>=0?"+":""}${state.pitchOff.toFixed(1)}°`, W/2, H-14);
+    ctx.textAlign="left";
+  }
+}
+
+function headingNow(basis){
+  return (Math.atan2(basis.fwd[0],basis.fwd[1])*R2D+360)%360;
+}
+
+function labelsAR(vis){
+  const cands=vis.filter(p=>p._on&&p._x>-40&&p._x<W+40&&p._y>-20&&p._y<H+40)
+                 .sort((a,b)=>b.alt-a.alt);
+  const placed=[];
+  ctx.textAlign="center";
+  for(const p of cands){
+    const sel=state.selected&&state.selected.n===p.n;
+    ctx.font="600 13px ui-sans-serif,-apple-system,sans-serif";
+    const tw=ctx.measureText(p.n).width+12;
+    let lift=26, box=null, ok=false;
+    for(let k=0;k<5;k++){
+      box={x:p._x-tw/2, y:p._y-lift-16, w:tw, h:32};
+      if(!placed.some(b=>!(box.x+box.w<b.x||b.x+b.w<box.x||box.y+box.h<b.y||b.y+b.h<box.y))){ok=true;break;}
+      lift+=34;
+    }
+    if(!ok) continue;
+    placed.push(box);
+    const c=sel?"#ff9d5c":"rgba(214,238,252,.95)";
+    ctx.strokeStyle=sel?"rgba(255,157,92,.9)":"rgba(214,238,252,.55)"; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(p._x,p._y-3); ctx.lineTo(p._x,p._y-lift+4); ctx.stroke();
+    ctx.beginPath(); ctx.arc(p._x,p._y,3,0,7); ctx.fillStyle=c; ctx.fill();
+    ctx.fillStyle="rgba(8,14,20,.6)";
+    ctx.fillRect(box.x,box.y,box.w,box.h);
+    ctx.fillStyle=c;
+    ctx.fillText(p.n,p._x,box.y+14);
+    ctx.font="400 10px ui-sans-serif,sans-serif";
+    ctx.fillStyle=sel?"rgba(255,157,92,.85)":"rgba(175,200,220,.9)";
+    ctx.fillText(`${fmtElev(p.e)} · ${fmtDist(p.d)}`,p._x,box.y+27);
+  }
+  ctx.textAlign="left";
+}
+
+function drawSunAR(basis,f){
+  const now=new Date(), day=new Date(now); day.setHours(0,0,0,0);
+  ctx.strokeStyle="rgba(255,196,120,.45)"; ctx.lineWidth=1.5;
+  ctx.beginPath(); let go=false;
+  for(let m=0;m<=1440;m+=8){
+    const s=sunPos(new Date(day.getTime()+m*60000),state.lat,state.lon);
+    if(s.alt<-2){go=false;continue;}
+    const pt=projectAR(basis,f,s.az,s.alt);
+    if(!pt||pt.x<-300||pt.x>W+300){go=false;continue;}
+    go?ctx.lineTo(pt.x,pt.y):(ctx.moveTo(pt.x,pt.y),go=true);
+  }
+  ctx.stroke();
+  const s=sunPos(now,state.lat,state.lon);
+  if(s.alt>-2){
+    const pt=projectAR(basis,f,s.az,s.alt);
+    if(pt){
+      const g=ctx.createRadialGradient(pt.x,pt.y,0,pt.x,pt.y,24);
+      g.addColorStop(0,"rgba(255,222,160,.9)"); g.addColorStop(1,"rgba(255,190,110,0)");
+      ctx.fillStyle=g; ctx.beginPath(); ctx.arc(pt.x,pt.y,24,0,7); ctx.fill();
+    }
+  }
+}
+
+/* ---- drawn panorama mode (no camera) ---- */
+
+const NEAR=[14,21,28], FAR=[150,176,196];
+const lerpColor=(a,b,t)=>{t=Math.max(0,Math.min(1,t));
+  return `rgb(${Math.round(a[0]+(b[0]-a[0])*t)},${Math.round(a[1]+(b[1]-a[1])*t)},${Math.round(a[2]+(b[2]-a[2])*t)})`;};
+const ppdDraw=()=>W/state.drawFov;
+const xDraw=az=>W/2+angDiff(az,state.drawAz)*ppdDraw();
+const yDraw=alt=>H/2-(alt-state.drawAlt)*ppdDraw();
+const hash=s=>{let h=2166136261;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619);}return ((h>>>0)%1000)/1000;};
+
+function drawPanorama(){
+  const ppd=ppdDraw(), yHor=yDraw(0);
+  const g=ctx.createLinearGradient(0,0,0,Math.max(yHor,1));
+  g.addColorStop(0,"#08121f"); g.addColorStop(.55,"#1d3550"); g.addColorStop(1,"#6d8ca3");
+  ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+  if(state.sun) drawSunFlat();
+  ctx.strokeStyle="rgba(255,255,255,.07)"; ctx.beginPath(); ctx.moveTo(0,yHor); ctx.lineTo(W,yHor); ctx.stroke();
+
+  for(const p of state.visible.slice().sort((a,b)=>b.d-a.d)){
+    const t=Math.pow(Math.min(1,p.d/(state.range*1000)),.62);
+    const x=xDraw(p.az), w=p.halfW*ppd;
+    if(x<-w-80||x>W+w+80){p._x=undefined;continue;}
+    const apexY=yDraw(p.alt), baseY=Math.max(yDraw(Math.min(0,p.alt-0.4)),apexY+4);
+    const skew=(hash(p.n)-.5)*.55;
+    ctx.fillStyle=lerpColor(NEAR,FAR,t);
+    ctx.beginPath();
+    ctx.moveTo(x-w,H); ctx.lineTo(x-w,baseY);
+    ctx.quadraticCurveTo(x-w*.45,baseY-(baseY-apexY)*(.52+skew*.2),x-w*.12,apexY+(baseY-apexY)*.06);
+    ctx.lineTo(x,apexY);
+    ctx.quadraticCurveTo(x+w*.30,apexY+(baseY-apexY)*(.30-skew*.15),x+w*.55,baseY-(baseY-apexY)*.32);
+    ctx.lineTo(x+w,baseY); ctx.lineTo(x+w,H); ctx.closePath(); ctx.fill();
+    p._x=x; p._y=apexY; p._on=true;
+  }
+
+  ctx.fillStyle="#070b0f";
+  const gy=yDraw(-1.6);
+  ctx.beginPath(); ctx.moveTo(0,H); ctx.lineTo(0,gy);
+  for(let x=0;x<=W;x+=24) ctx.lineTo(x,gy+Math.sin((x+state.drawAz*8)*.012)*6+Math.sin(x*.031)*3);
+  ctx.lineTo(W,H); ctx.closePath(); ctx.fill();
+
+  labelsFlat();
+  compassStrip();
+}
+
+function labelsFlat(){
+  const cands=state.visible.filter(p=>p.vis&&p._x>-60&&p._x<W+60).sort((a,b)=>b.alt-a.alt);
+  const placed=[];
+  for(const p of cands){
+    const x=p._x,y=p._y;
+    if(y<-40||y>H) continue;
+    const box={x:x-9,y:y-96,w:18,h:96};
+    if(placed.some(b=>!(box.x+box.w<b.x||b.x+b.w<box.x||box.y+box.h<b.y||b.y+b.h<box.y))) continue;
+    placed.push(box);
+    const sel=state.selected&&state.selected.n===p.n;
+    ctx.strokeStyle=sel?"#ff9d5c":"rgba(226,238,246,.5)"; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(x,y-3); ctx.lineTo(x,y-16); ctx.stroke();
+    ctx.save(); ctx.translate(x,y-19); ctx.rotate(-Math.PI/3);
+    ctx.font="500 12px ui-sans-serif,-apple-system,sans-serif";
+    ctx.fillStyle=sel?"#ff9d5c":"rgba(235,244,250,.95)";
+    ctx.shadowColor="rgba(0,0,0,.7)"; ctx.shadowBlur=4; ctx.fillText(p.n,0,4); ctx.shadowBlur=0;
+    ctx.font="400 10px ui-sans-serif,sans-serif";
+    ctx.fillStyle=sel?"rgba(255,157,92,.8)":"rgba(180,200,216,.75)";
+    ctx.fillText(fmtElev(p.e),0,15);
+    ctx.restore();
+  }
+}
+
+function compassStrip(){
+  const ppd=ppdDraw();
+  ctx.save();
+  ctx.fillStyle="rgba(8,14,22,.5)"; ctx.fillRect(0,40,W,26);
+  ctx.font="500 11px ui-sans-serif,sans-serif"; ctx.textAlign="center";
+  const names={0:"N",45:"NE",90:"E",135:"SE",180:"S",225:"SW",270:"W",315:"NW"};
+  for(let a=0;a<360;a+=15){
+    const x=W/2+angDiff(a,state.drawAz)*ppd;
+    if(x<-20||x>W+20) continue;
+    const major=a%45===0;
+    ctx.strokeStyle=major?"rgba(220,235,245,.55)":"rgba(220,235,245,.2)";
+    ctx.beginPath(); ctx.moveTo(x,62); ctx.lineTo(x,major?52:57); ctx.stroke();
+    if(major){ ctx.fillStyle=a===0?"#ff9d5c":"rgba(230,240,248,.85)"; ctx.fillText(names[a],x,50); }
+  }
+  ctx.restore(); ctx.textAlign="left";
+}
+
+function drawSunFlat(){
+  const now=new Date(), day=new Date(now); day.setHours(0,0,0,0);
+  ctx.strokeStyle="rgba(255,196,120,.35)"; ctx.lineWidth=1.5;
+  ctx.beginPath(); let go=false;
+  for(let m=0;m<=1440;m+=8){
+    const s=sunPos(new Date(day.getTime()+m*60000),state.lat,state.lon);
+    if(s.alt<-2||Math.abs(angDiff(s.az,state.drawAz))>state.drawFov/2+6){go=false;continue;}
+    const x=xDraw(s.az), y=yDraw(s.alt);
+    go?ctx.lineTo(x,y):(ctx.moveTo(x,y),go=true);
+  }
+  ctx.stroke();
+  const s=sunPos(now,state.lat,state.lon);
+  if(s.alt>-2&&Math.abs(angDiff(s.az,state.drawAz))<state.drawFov/2+4){
+    const x=xDraw(s.az),y=yDraw(s.alt);
+    const g=ctx.createRadialGradient(x,y,0,x,y,26);
+    g.addColorStop(0,"rgba(255,222,160,.95)"); g.addColorStop(1,"rgba(255,190,110,0)");
+    ctx.fillStyle=g; ctx.beginPath(); ctx.arc(x,y,26,0,7); ctx.fill();
+    ctx.fillStyle="#ffe6b3"; ctx.beginPath(); ctx.arc(x,y,5,0,7); ctx.fill();
+  }
+}
+
+function drawTapTargets(){}
+
+/* ---------------- formatting ---------------- */
+
+const fmtElev=m=>state.units==="ft"?Math.round(m*3.28084).toLocaleString()+" ft":Math.round(m).toLocaleString()+" m";
+const fmtDist=m=>state.units==="ft"?(m/1609.34).toFixed(1)+" mi":(m/1000).toFixed(1)+" km";
+const compassName=az=>["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"][Math.round(az/22.5)%16];
+
+/* ---------------- sensors ---------------- */
+
+let orientHandler=null, rafOn=false;
+
+function startLoop(){
+  if(rafOn) return;
+  rafOn=true;
+  const tick=()=>{ if(state.mode==="camera"&&!state.locked) draw(); requestAnimationFrame(tick); };
+  requestAnimationFrame(tick);
+}
+
+async function askMotion(){
+  try{
+    if(typeof DeviceOrientationEvent!=="undefined"&&DeviceOrientationEvent.requestPermission){
+      const r=await DeviceOrientationEvent.requestPermission();
+      if(r!=="granted") return false;
+    }
+  }catch(e){ return false; }
+  orientHandler=ev=>{
+    if(ev.alpha==null&&ev.webkitCompassHeading==null) return;
+    let alpha=ev.alpha;
+    if(typeof ev.webkitCompassHeading==="number") alpha=360-ev.webkitCompassHeading;  // iOS: true north
+    else if(!ev.absolute && !state._warned){ state._warned=true; }
+    state.orient={alpha:alpha||0, beta:ev.beta||0, gamma:ev.gamma||0};
+  };
+  window.addEventListener("deviceorientationabsolute",orientHandler,true);
+  window.addEventListener("deviceorientation",orientHandler,true);
+  return true;
+}
+
+async function startCamera(){
+  const warn=$("gateWarn");
+  if(!window.isSecureContext){
+    warn.textContent="The camera needs an https page. Opening this file directly won't work — host it (GitHub Pages, Netlify Drop, or a local https server) and open that link.";
+    return false;
+  }
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({
+      video:{facingMode:{ideal:"environment"}, width:{ideal:1920}, height:{ideal:1080}}, audio:false
+    });
+    vid.srcObject=stream; await vid.play();
+    vid.style.display="block";
+    return true;
+  }catch(e){
+    warn.textContent="Camera declined or unavailable: "+e.name+". The drawn panorama still works.";
+    return false;
+  }
+}
+
+$("btnStart").onclick=async()=>{
+  const ok=await startCamera();
+  if(!ok) return;
+  const m=await askMotion();
+  if(!m) $("gateWarn").textContent="Compass access declined — the overlay can't track without it.";
+  state.mode="camera"; $("btnMode").textContent="Camera"; $("btnMode").setAttribute("aria-pressed","true");
+  $("gate").style.display="none";
+  navigator.geolocation&&navigator.geolocation.getCurrentPosition(pos=>{
+    state.lat=pos.coords.latitude; state.lon=pos.coords.longitude;
+    if(pos.coords.altitude!=null) state.elev=pos.coords.altitude;
+    state.label="Your location"; syncInputs(); refresh();
+  },()=>{},{enableHighAccuracy:true,timeout:10000});
+  startLoop(); refresh();
+};
+$("btnSkip").onclick=()=>{ state.mode="draw"; setModeUI(); $("gate").style.display="none"; refresh(); };
+
+/* ---------------- interaction ---------------- */
+
+const pointers=new Map(); let pinch=null;
+
+cv.addEventListener("pointerdown",e=>{
+  cv.setPointerCapture(e.pointerId);
+  pointers.set(e.pointerId,{x:e.clientX,y:e.clientY,moved:0});
+  if(pointers.size===2){
+    const [a,b]=[...pointers.values()];
+    pinch={d:Math.hypot(a.x-b.x,a.y-b.y), fov:state.mode==="camera"?state.fovLong:state.drawFov};
+  }
+});
+cv.addEventListener("pointermove",e=>{
+  const p=pointers.get(e.pointerId); if(!p) return;
+  const dx=e.clientX-p.x, dy=e.clientY-p.y;
+  p.moved+=Math.abs(dx)+Math.abs(dy); p.x=e.clientX; p.y=e.clientY;
+  if(pointers.size===2&&pinch){
+    const [a,b]=[...pointers.values()];
+    const d=Math.hypot(a.x-b.x,a.y-b.y);
+    if(state.mode==="camera"){
+      state.fovLong=Math.max(30,Math.min(100,pinch.fov*pinch.d/Math.max(d,1)));
+      $("fov").value=state.fovLong.toFixed(1); $("fovVal").textContent=state.fovLong.toFixed(1)+"°";
+    }else{
+      state.drawFov=Math.max(8,Math.min(140,pinch.fov*pinch.d/Math.max(d,1)));
+    }
+    draw(); return;
+  }
+  if(pointers.size!==1) return;
+  if(state.mode==="camera"){
+    if(!state.aligning) return;
+    const degPerPx=state.fovLong/Math.max(W,H);
+    state.headOff=clamp(state.headOff-dx*degPerPx,-30,30);
+    state.pitchOff=clamp(state.pitchOff+dy*degPerPx,-20,20);
+    $("hoff").value=state.headOff.toFixed(1); $("hoffVal").textContent=state.headOff.toFixed(1)+"°";
+    draw();
+  }else{
+    state.drawAz=(state.drawAz-dx/ppdDraw()+360)%360;
+    state.drawAlt=state.drawAlt+dy/ppdDraw();
+    draw();
+  }
+});
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+function endPointer(e){
+  const p=pointers.get(e.pointerId);
+  if(p&&p.moved<8&&pointers.size===1) pick(e.clientX,e.clientY);
+  pointers.delete(e.pointerId); if(pointers.size<2) pinch=null;
+}
+cv.addEventListener("pointerup",endPointer);
+cv.addEventListener("pointercancel",e=>{pointers.delete(e.pointerId);pinch=null;});
+cv.addEventListener("wheel",e=>{
+  e.preventDefault();
+  if(state.mode==="camera"){
+    state.fovLong=clamp(state.fovLong*(1+Math.sign(e.deltaY)*.06),30,100);
+    $("fov").value=state.fovLong.toFixed(1); $("fovVal").textContent=state.fovLong.toFixed(1)+"°";
+  } else state.drawFov=clamp(state.drawFov*(1+Math.sign(e.deltaY)*.08),8,140);
+  draw();
+},{passive:false});
+
+function pick(cx,cy){
+  const r=cv.getBoundingClientRect(), x=cx-r.left, y=cy-r.top;
+  let best=null,bd=1e9;
+  for(const p of state.visible){
+    if(p._x===undefined||!p._on) continue;
+    const d=Math.hypot(p._x-x,p._y-y);
+    if(d<bd){bd=d;best=p;}
+  }
+  if(best&&bd<52) showReadout(best); else hideReadout();
+}
+
+const readout=$("readout");
+function showReadout(p){
+  state.selected=p;
+  readout.innerHTML=`<span class="close" id="roClose">✕</span><b>${p.n}</b>`+
+    `<div class="sub">${fmtElev(p.e)} · ${fmtDist(p.d)} away</div>`+
+    `<div class="sub">Bearing ${Math.round(p.az)}° ${compassName(p.az)} · ${p.alt.toFixed(1)}° above your eye line</div>`+
+    (p.vis?"":`<div class="sub">Hidden behind closer terrain</div>`);
+  readout.style.display="block";
+  $("roClose").onclick=hideReadout;
+  draw();
+}
+function hideReadout(){ state.selected=null; readout.style.display="none"; draw(); }
+
+/* ---------------- controls ---------------- */
+
+function setModeUI(){
+  const cam=state.mode==="camera";
+  $("btnMode").textContent=cam?"Camera":"Drawing";
+  $("btnMode").setAttribute("aria-pressed",cam?"true":"false");
+  vid.style.display=cam&&vid.srcObject?"block":"none";
+  $("btnAlign").style.display=cam?"":"none";
+  $("btnLock").style.display=cam?"":"none";
+}
+$("btnMode").onclick=async()=>{
+  if(state.mode==="camera"){ state.mode="draw"; setModeUI(); draw(); return; }
+  if(!vid.srcObject){ const ok=await startCamera(); if(!ok){ $("gate").style.display="flex"; return; } await askMotion(); startLoop(); }
+  state.mode="camera"; setModeUI(); draw();
+};
+$("btnAlign").onclick=()=>{
+  state.aligning=!state.aligning;
+  $("btnAlign").setAttribute("aria-pressed",state.aligning?"true":"false");
+  $("btnAlign").textContent=state.aligning?"Aligning":"Align";
+  draw();
+};
+$("btnLock").onclick=()=>{
+  state.locked=!state.locked;
+  $("btnLock").setAttribute("aria-pressed",state.locked?"true":"false");
+  $("btnLock").textContent=state.locked?"Locked":"Lock heading";
+};
+$("btnSun").onclick=()=>{ state.sun=!state.sun; $("btnSun").setAttribute("aria-pressed",state.sun?"true":"false"); draw(); };
+$("btnUnits").onclick=()=>{ state.units=state.units==="ft"?"m":"ft"; $("btnUnits").textContent=state.units;
+  syncInputs(); paintList(); state.selected?showReadout(state.selected):draw(); };
+$("btnTray").onclick=()=>{ const t=$("tray"); t.classList.toggle("open");
+  $("btnTray").textContent=t.classList.contains("open")?"Done":"Setup"; setTimeout(resize,230); };
+
+$("fov").oninput=e=>{ state.fovLong=+e.target.value; $("fovVal").textContent=state.fovLong.toFixed(1)+"°"; draw(); };
+$("hoff").oninput=e=>{ state.headOff=+e.target.value; $("hoffVal").textContent=state.headOff.toFixed(1)+"°"; draw(); };
+$("btnFlip").onclick=()=>{ state.flip=!state.flip; draw(); };
+$("btnReset").onclick=()=>{ state.headOff=0; state.pitchOff=0; state.fovLong=67; state.flip=false;
+  $("hoff").value=0; $("hoffVal").textContent="0°"; $("fov").value=67; $("fovVal").textContent="67°"; draw(); };
+
+const sel=$("view");
+VIEWS.forEach((v,i)=>{const o=document.createElement("option");o.value=i;o.textContent=v[0];sel.appendChild(o);});
+sel.onchange=()=>{ const v=VIEWS[+sel.value]; state.lat=v[1];state.lon=v[2];state.elev=v[3];state.label=v[0];
+  syncInputs(); refresh(); };
+function syncInputs(){
+  $("lat").value=state.lat.toFixed(5); $("lon").value=state.lon.toFixed(5); $("elev").value=Math.round(state.elev);
+  $("where").innerHTML=`${state.label}<br>${state.lat.toFixed(4)}, ${state.lon.toFixed(4)} · ${fmtElev(state.elev)}`;
+}
+$("btnApply").onclick=()=>{
+  const la=parseFloat($("lat").value),lo=parseFloat($("lon").value),el=parseFloat($("elev").value);
+  if([la,lo,el].some(isNaN)){ alert("Latitude, longitude and elevation all need numbers."); return; }
+  state.lat=la;state.lon=lo;state.elev=el;state.label="Custom viewpoint";
+  syncInputs(); refresh(); $("tray").classList.remove("open"); $("btnTray").textContent="Setup"; setTimeout(resize,230);
+};
+$("btnGeo").onclick=()=>{
+  if(!navigator.geolocation){ alert("This browser won't share a location."); return; }
+  $("btnGeo").textContent="Locating…";
+  navigator.geolocation.getCurrentPosition(pos=>{
+    state.lat=pos.coords.latitude; state.lon=pos.coords.longitude;
+    if(pos.coords.altitude!=null) state.elev=pos.coords.altitude;
+    state.label="Your location"; $("btnGeo").textContent="Use my location"; syncInputs(); refresh();
+  },()=>{ $("btnGeo").textContent="Use my location"; alert("Location unavailable — type coordinates instead."); },
+  {enableHighAccuracy:true,timeout:10000});
+};
+$("range").oninput=e=>{ state.range=+e.target.value; $("rangeVal").textContent=state.range+" km"; refresh(); };
+$("minang").oninput=e=>{ state.minAng=+e.target.value; $("minangVal").textContent=state.minAng.toFixed(1)+"°"; refresh(); };
+
+function paintList(){
+  const el=$("plist"); el.innerHTML="";
+  const v=state.visible.filter(p=>p.vis).slice(0,40);
+  if(!v.length){ el.innerHTML=`<button style="color:var(--dim)">Nothing in range. Widen the range or load peaks for this area.</button>`; return; }
+  for(const p of v){
+    const b=document.createElement("button");
+    b.innerHTML=`<span>${p.n}</span><span class="d">${fmtElev(p.e)} · ${fmtDist(p.d)} · ${compassName(p.az)}</span>`;
+    b.onclick=()=>{
+      if(state.mode==="draw"){ state.drawAz=p.az; state.drawAlt=Math.max(1.2,p.alt*.8); state.drawFov=Math.min(state.drawFov,45); }
+      $("tray").classList.remove("open"); $("btnTray").textContent="Setup"; setTimeout(resize,230);
+      showReadout(p);
+    };
+    el.appendChild(b);
+  }
+}
+
+/* OpenStreetMap peaks */
+const overpassQuery=()=>`[out:json][timeout:30];node["natural"="peak"]["name"]["ele"](around:${Math.round(state.range*1000)},${state.lat.toFixed(5)},${state.lon.toFixed(5)});out;`;
+function ingest(json){
+  const have=new Set(state.peaks.map(p=>p.n+"|"+p.lat.toFixed(3)));
+  let added=0;
+  for(const e of (json.elements||[])){
+    if(!e.tags||!e.tags.name) continue;
+    const ele=parseFloat(String(e.tags.ele).replace(/[^\d.\-]/g,""));
+    if(isNaN(ele)) continue;
+    const key=e.tags.name+"|"+e.lat.toFixed(3);
+    if(have.has(key)) continue;
+    have.add(key); state.peaks.push({n:e.tags.name,lat:e.lat,lon:e.lon,e:ele}); added++;
+  }
+  return added;
+}
+$("btnOsm").onclick=async()=>{
+  const st=$("osmStatus"); st.textContent="Asking OpenStreetMap…";
+  const url="https://overpass-api.de/api/interpreter?data="+encodeURIComponent(overpassQuery());
+  try{
+    const res=await fetch(url); const json=await res.json();
+    st.textContent=`Added ${ingest(json)} summits.`; refresh();
+  }catch(err){
+    $("osmFallback").style.display="block"; $("osmUrl").value=url;
+    st.textContent="Couldn't reach it from here — use the paste route below.";
+  }
+};
+$("btnPaste").onclick=()=>{
+  try{ const n=ingest(JSON.parse($("osmPaste").value)); $("osmStatus").textContent=`Added ${n} summits.`;
+    $("osmPaste").value=""; refresh(); }
+  catch(e){ $("osmStatus").textContent="That text wasn't valid JSON."; }
+};
+
+/* ---------------- boot ---------------- */
+
+function refresh(){ compute(); draw(); }
+if(!window.isSecureContext){
+  $("gateWarn").textContent="Heads up: this page isn't on https, so the camera and compass will be blocked. Host it and open the https link — the drawn panorama works either way.";
+}
+setModeUI();
+syncInputs();
+resize();
+refresh();
+</script>
+</body>
+</html>
