@@ -174,6 +174,20 @@
     </fieldset>
 
     <fieldset>
+      <legend>Terrain</legend>
+      <p class="note">Ridge outlines are guessed from summit points until you build a horizon from real
+      elevation data. Building fetches terrain tiles for this viewpoint once — roughly 20–30 MB — then
+      caches the finished profile so it works offline.</p>
+      <div class="row" style="margin-top:.5rem">
+        <button class="btn primary" id="btnDem">Build horizon</button>
+        <button class="btn" id="btnDemClear">Clear cache</button>
+      </div>
+      <p class="note" id="demStatus" style="margin-top:.5rem"></p>
+      <p class="note" style="margin-top:.4rem">Elevation data: <b>U.S. Geological Survey</b> (3DEP / SRTM),
+      served as AWS Terrain Tiles by Tilezen/Mapzen.</p>
+    </fieldset>
+
+    <fieldset>
       <legend>Peaks in view</legend>
       <div class="peaklist" id="plist"></div>
     </fieldset>
@@ -191,7 +205,7 @@
       <p class="note" id="osmStatus" style="margin-top:.5rem"></p>
     </fieldset>
 
-    <p class="note">Ridge outlines are built from summit points rather than elevation tiles, so the line between
+    <p class="note" id="footNote">Ridge outlines are built from summit points rather than elevation tiles, so the line between
     peaks is approximate. Bearings, distances and heights above the horizon are computed properly, including
     earth curvature and refraction.</p>
   </div>
@@ -286,7 +300,8 @@ const state={
   sawOrientation:false, nonAbsoluteHandled:false, absoluteOverride:false, _absTimer:null,
   screenAngle:0,
   drawAz:270, drawAlt:2.2, drawFov:90,
-  peaks:PEAKS.slice(), visible:[], selected:null
+  peaks:PEAKS.slice(), visible:[], selected:null,
+  horizon:null, demBusy:false
 };
 
 /* ---------------- persisted settings ---------------- */
@@ -340,6 +355,129 @@ if(screen.orientation&&screen.orientation.addEventListener){
   screen.orientation.addEventListener("change",()=>{ state.screenAngle=screen.orientation.angle||0; draw(); });
 }
 
+/* ---------------- DEM horizon profile ---------------- */
+
+/* The raycast itself lives in horizon-worker.js. This side owns the cache, the
+   lifecycle and the lookup. A profile is 3600 samples of azimuth -> apparent
+   altitude, plus the coordinate and distance of each horizon point, so the same
+   array drives the drawn silhouette and peak occlusion. Without one the app
+   falls back to the old summit-point heuristic, which is also what keeps it
+   working offline on a viewpoint it has never seen. */
+
+const IDB_NAME="skyline-ar", IDB_STORE="horizons", IDB_VER=1;
+
+function idbOpen(){
+  return new Promise((res,rej)=>{
+    let r; try{ r=indexedDB.open(IDB_NAME,IDB_VER); }catch(e){ return rej(e); }
+    r.onupgradeneeded=()=>{ const db=r.result;
+      if(!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE,{keyPath:"key"}); };
+    r.onsuccess=()=>res(r.result);
+    r.onerror=()=>rej(r.error);
+  });
+}
+async function idbDo(mode,fn){
+  let db; try{ db=await idbOpen(); }catch(e){ return null; }
+  return new Promise(res=>{
+    const tx=db.transaction(IDB_STORE,mode), st=tx.objectStore(IDB_STORE);
+    const req=fn(st);
+    tx.oncomplete=()=>{ db.close(); res(req?req.result:null); };
+    tx.onerror=()=>{ db.close(); res(null); };
+  });
+}
+
+/* Rounded viewpoint. 0.002 deg is about 220 m of latitude — fine enough that the
+   near ridges do not shift visibly, coarse enough that GPS jitter keeps hitting
+   the same cache entry instead of triggering a fresh 25 MB fetch. */
+const viewKey=(lat,lon,h0)=>
+  `${(Math.round(lat/0.002)*0.002).toFixed(3)}|${(Math.round(lon/0.002)*0.002).toFixed(3)}|${Math.round(h0/20)*20}`;
+const currentKey=()=>viewKey(state.lat,state.lon,state.elev+state.eye);
+
+/* Linear interpolation into the profile. NaN where the raycast found no tile. */
+function horizonAltAt(az){
+  const hz=state.horizon; if(!hz) return NaN;
+  const t=((az%360)+360)%360/hz.dAz;
+  const i=Math.floor(t), fr=t-i;
+  const a=hz.alt[i%hz.n], b=hz.alt[(i+1)%hz.n];
+  if(a!==a||b!==b) return a===a?a:b;
+  return a+(b-a)*fr;
+}
+function horizonDistAt(az){
+  const hz=state.horizon; if(!hz) return NaN;
+  const i=Math.round(((az%360)+360)%360/hz.dAz)%hz.n;
+  return hz.srcDist[i];
+}
+
+function demStatus(msg){ const el=$("demStatus"); if(el) el.textContent=msg; }
+function demSyncNote(){
+  const f=$("footNote"); if(!f) return;
+  f.textContent=state.horizon
+    ? "Skyline drawn from USGS elevation data raycast around this viewpoint, with earth curvature and refraction applied at every step. Peaks are marked hidden when the terrain profile stands in front of them."
+    : "Ridge outlines are built from summit points rather than elevation tiles, so the line between peaks is approximate. Bearings, distances and heights above the horizon are computed properly, including earth curvature and refraction.";
+}
+
+async function loadCachedHorizon(){
+  const key=currentKey();
+  const rec=await idbDo("readonly",st=>st.get(key));
+  if(rec&&rec.n){
+    state.horizon=rec;
+    demStatus(`Horizon loaded from cache (${new Date(rec.created).toLocaleDateString()}).`);
+  }else{
+    state.horizon=null;
+    demStatus("No horizon built for this viewpoint yet.");
+  }
+  demSyncNote(); refresh();
+  return !!state.horizon;
+}
+
+let demWorker=null, demJob=0;
+function demStart(){
+  if(state.demBusy){ demCancel(); return; }
+  if(!window.Worker){ demStatus("This browser has no Web Workers, so the raycast can't run."); return; }
+  try{ if(!demWorker){ demWorker=new Worker("horizon-worker.js"); demWorker.onmessage=demMessage;
+        demWorker.onerror=e=>{ state.demBusy=false; demButton();
+          demStatus("Couldn't start the raycaster: "+(e.message||"worker failed to load")); }; } }
+  catch(e){ demStatus("Couldn't start the raycaster: "+e.message); return; }
+
+  state.demBusy=true; demButton();
+  const id=++demJob;
+  demStatus("Fetching elevation tiles…");
+  demWorker.postMessage({type:"horizon", id, lat:state.lat, lon:state.lon,
+                         h0:state.elev+state.eye, azSteps:3600});
+}
+function demCancel(){
+  if(demWorker) demWorker.postMessage({type:"cancel"});
+  state.demBusy=false; demButton(); demStatus("Cancelled.");
+}
+function demButton(){ const b=$("btnDem"); if(b) b.textContent=state.demBusy?"Cancel":"Build horizon"; }
+
+async function demMessage(ev){
+  const m=ev.data;
+  if(m.id!==demJob&&m.type!=="cancelled") return;
+  if(m.type==="progress"){
+    demStatus(m.phase==="tiles"
+      ? `Fetching elevation tiles… ${m.done} of ${m.total}`
+      : `Raycasting the horizon… ${Math.round(m.done/m.total*100)}%`);
+  }else if(m.type==="done"){
+    state.demBusy=false; demButton();
+    const key=currentKey();
+    state.horizon=Object.assign({key},m.profile);
+    await idbDo("readwrite",st=>st.put(state.horizon));
+    demStatus(`Horizon built from ${m.profile.tiles} tiles. Cached for offline use.`);
+    demSyncNote(); refresh();
+  }else if(m.type==="cancelled"){
+    state.demBusy=false; demButton();
+  }else if(m.type==="error"){
+    state.demBusy=false; demButton();
+    demStatus(m.message);
+  }
+}
+
+$("btnDem").onclick=demStart;
+$("btnDemClear").onclick=async()=>{
+  await idbDo("readwrite",st=>st.clear());
+  state.horizon=null; demStatus("Cached horizons cleared."); demSyncNote(); refresh();
+};
+
 /* ---------------- peak computation ---------------- */
 
 const baseRadius=d=>Math.max(700,d*0.11);
@@ -377,6 +515,20 @@ function compute(){
     }
     p.ridge=pts;
   }
+  /* A real terrain profile supersedes the bin-buffer guess. The buffer above is
+     still filled because it is the offline fallback and drawPanorama() leans on
+     halfW and ridge; the profile just overrules its visibility verdict.
+     The 0.08 deg slack is because a surveyed summit elevation and the DEM's
+     value for the same pixel differ by a few metres — Mount Elbert reads 4396 m
+     in the tiles against 4401 m in the table — and a peak must not occlude
+     itself. */
+  if(state.horizon){
+    for(const p of out){
+      const ha=horizonAltAt(p.az);
+      p.vis = ha!==ha ? p.vis : p.alt > ha-0.08;
+    }
+  }
+
   state.visible=out;
   paintList();
   if(state.mode==="draw"){
@@ -601,8 +753,10 @@ function drawAR(){
   }
   ctx.stroke();
 
-  // ridge outlines, far to near
-  for(const p of state.visible.slice().sort((a,b)=>b.d-a.d)){
+  const drewProfile=drawHorizonAR(basis,f);
+
+  // ridge outlines, far to near — the summit-point guess, only when there is no profile
+  if(!drewProfile) for(const p of state.visible.slice().sort((a,b)=>b.d-a.d)){
     const t=Math.min(1,p.d/(state.range*1000));
     ctx.strokeStyle=p.vis?`rgba(140,205,245,${0.65-0.35*t})`:`rgba(140,175,205,${0.18})`;
     ctx.lineWidth=p.vis?1.6:1;
@@ -614,6 +768,8 @@ function drawAR(){
       go?ctx.lineTo(pt.x,pt.y):(ctx.moveTo(pt.x,pt.y),go=true);
     }
     if(any) ctx.stroke();
+  }
+  for(const p of state.visible){
     const apex=projectAR(basis,f,p.az,p.alt);
     p._x=apex?apex.x:undefined; p._y=apex?apex.y:undefined; p._on=!!apex;
   }
@@ -651,6 +807,26 @@ function drawCalibration(basis,f){
   ctx.moveTo(pt.x-38,pt.y); ctx.lineTo(pt.x-30,pt.y); ctx.moveTo(pt.x+30,pt.y); ctx.lineTo(pt.x+38,pt.y);
   ctx.moveTo(pt.x,pt.y-38); ctx.lineTo(pt.x,pt.y-30); ctx.moveTo(pt.x,pt.y+30); ctx.lineTo(pt.x,pt.y+38);
   ctx.stroke();
+}
+
+/* Real skyline, straight from the raycast profile. Stepped in azimuth rather
+   than screen space because the profile is an azimuth array; 0.2 deg is about a
+   pixel and a half at a 67 deg field of view on a phone in landscape. */
+function drawHorizonAR(basis,f){
+  if(!state.horizon) return false;
+  const head=headingNow(basis);
+  ctx.strokeStyle="rgba(150,212,247,.9)"; ctx.lineWidth=1.8;
+  ctx.beginPath(); let go=false;
+  for(let a=-100;a<=100;a+=0.2){
+    const az=(head+a+360)%360;
+    const alt=horizonAltAt(az);
+    if(alt!==alt){ go=false; continue; }
+    const pt=projectAR(basis,f,az,alt);
+    if(!pt||pt.x<-600||pt.x>W+600){ go=false; continue; }
+    go?ctx.lineTo(pt.x,pt.y):(ctx.moveTo(pt.x,pt.y),go=true);
+  }
+  ctx.stroke();
+  return true;
 }
 
 function headingNow(basis){
@@ -730,6 +906,10 @@ function drawPanorama(){
   if(state.sun) drawSunFlat();
   ctx.strokeStyle="rgba(255,255,255,.07)"; ctx.beginPath(); ctx.moveTo(0,yHor); ctx.lineTo(W,yHor); ctx.stroke();
 
+  if(drawHorizonFlat()){
+    for(const p of state.visible){ const x=xDraw(p.az);
+      p._x=(x<-90||x>W+90)?undefined:x; p._y=yDraw(p.alt); p._on=p._x!==undefined; }
+  }else
   for(const p of state.visible.slice().sort((a,b)=>b.d-a.d)){
     const t=Math.pow(Math.min(1,p.d/(state.range*1000)),.62);
     const x=xDraw(p.az), w=p.halfW*ppd;
@@ -754,6 +934,25 @@ function drawPanorama(){
 
   labelsFlat();
   compassStrip();
+}
+
+/* The drawn panorama's version of the profile: one shaded column per two
+   pixels, tinted by how far away that horizon point actually is, which is the
+   depth cue the summit-point silhouette was faking. */
+function drawHorizonFlat(){
+  if(!state.horizon) return false;
+  const ppd=ppdDraw(), maxD=state.range*1000;
+  for(let x=-2;x<=W+2;x+=2){
+    const az=(state.drawAz+(x-W/2)/ppd+3600)%360;
+    const alt=horizonAltAt(az);
+    if(alt!==alt) continue;
+    const d=horizonDistAt(az);
+    const t=Math.pow(Math.min(1,(d===d?d:maxD)/maxD),.62);
+    ctx.fillStyle=lerpColor(NEAR,FAR,t);
+    const y=yDraw(alt);
+    ctx.fillRect(x,y,2.5,Math.max(0,H-y));
+  }
+  return true;
 }
 
 function labelsFlat(){
@@ -914,7 +1113,7 @@ $("btnStart").onclick=async()=>{
   navigator.geolocation&&navigator.geolocation.getCurrentPosition(pos=>{
     state.lat=pos.coords.latitude; state.lon=pos.coords.longitude;
     if(pos.coords.altitude!=null) state.elev=pos.coords.altitude;
-    state.label="Your location"; syncInputs(); refresh();
+    state.label="Your location"; syncInputs(); viewpointChanged();
   },()=>{},{enableHighAccuracy:true,timeout:10000});
   startLoop(); refresh();
 };
@@ -1056,7 +1255,7 @@ $("btnReset").onclick=()=>{ state.headOff=0; state.pitchOff=0; state.fovLong=67;
 const sel=$("view");
 VIEWS.forEach((v,i)=>{const o=document.createElement("option");o.value=i;o.textContent=v[0];sel.appendChild(o);});
 sel.onchange=()=>{ const v=VIEWS[+sel.value]; state.lat=v[1];state.lon=v[2];state.elev=v[3];state.label=v[0];
-  syncInputs(); refresh(); };
+  syncInputs(); viewpointChanged(); };
 function syncInputs(){
   $("lat").value=state.lat.toFixed(5); $("lon").value=state.lon.toFixed(5); $("elev").value=Math.round(state.elev);
   $("where").innerHTML=`${state.label}<br>${state.lat.toFixed(4)}, ${state.lon.toFixed(4)} · ${fmtElev(state.elev)}`;
@@ -1065,7 +1264,7 @@ $("btnApply").onclick=()=>{
   const la=parseFloat($("lat").value),lo=parseFloat($("lon").value),el=parseFloat($("elev").value);
   if([la,lo,el].some(isNaN)){ alert("Latitude, longitude and elevation all need numbers."); return; }
   state.lat=la;state.lon=lo;state.elev=el;state.label="Custom viewpoint";
-  syncInputs(); refresh(); $("tray").classList.remove("open"); $("btnTray").textContent="Setup"; setTimeout(resize,230);
+  syncInputs(); viewpointChanged(); $("tray").classList.remove("open"); $("btnTray").textContent="Setup"; setTimeout(resize,230);
 };
 $("btnGeo").onclick=()=>{
   if(!navigator.geolocation){ alert("This browser won't share a location."); return; }
@@ -1073,7 +1272,7 @@ $("btnGeo").onclick=()=>{
   navigator.geolocation.getCurrentPosition(pos=>{
     state.lat=pos.coords.latitude; state.lon=pos.coords.longitude;
     if(pos.coords.altitude!=null) state.elev=pos.coords.altitude;
-    state.label="Your location"; $("btnGeo").textContent="Use my location"; syncInputs(); refresh();
+    state.label="Your location"; $("btnGeo").textContent="Use my location"; syncInputs(); viewpointChanged();
   },()=>{ $("btnGeo").textContent="Use my location"; alert("Location unavailable — type coordinates instead."); },
   {enableHighAccuracy:true,timeout:10000});
 };
@@ -1132,6 +1331,15 @@ $("btnPaste").onclick=()=>{
 
 function refresh(){ compute(); draw(); }
 
+/* Viewpoint moved: the old profile belongs to a different place. Drop it and
+   look for a cached one at the new spot. */
+function viewpointChanged(){
+  const k=currentKey();
+  if(state.horizon&&state.horizon.key===k){ refresh(); return; }
+  state.horizon=null; demSyncNote(); refresh();
+  loadCachedHorizon();
+}
+
 function syncPrefControls(){
   calPaintState();
   $("fov").value=state.fovLong.toFixed(1);   $("fovVal").textContent=state.fovLong.toFixed(1)+"°";
@@ -1150,6 +1358,8 @@ setModeUI();
 syncInputs();
 resize();
 refresh();
+demButton();
+loadCachedHorizon();
 </script>
 </body>
 </html>

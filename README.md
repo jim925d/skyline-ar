@@ -45,11 +45,18 @@ Open the https URL on a phone, tap **Start camera**, grant camera, motion and lo
 - **Peak data** — ~56 hand-entered Colorado summits, plus an Overpass (OpenStreetMap) loader for
   anywhere else, with a copy-paste fallback when the browser blocks the request
 
-## What it fakes
+## Terrain
 
-Ridge outlines are synthesized from summit points using an angular half-width heuristic
-(`max(700m, distance * 0.11)`). The real app raycasts a digital elevation model, so its skyline is
-actual terrain. Between two summits, this app is guessing.
+Tap **Build horizon** in Setup and the app raycasts a real digital elevation model around your
+viewpoint: ~163 terrain tiles, 3600 azimuths, curvature and refraction applied at every step. The
+resulting azimuth→altitude profile drives both the drawn silhouette and peak occlusion. It is cached
+in IndexedDB against a rounded viewpoint, so it survives a reload and works offline.
+
+Until you build one — or on a viewpoint with no cached profile and no signal — the app falls back to
+the old heuristic: ridge outlines synthesized from summit points with an angular half-width of
+`max(700m, distance * 0.11)`, and a 2880-bin skyline buffer for occlusion. Between two summits, that
+fallback is guessing. It is kept deliberately, because it is what makes the app work with no network
+and no camera.
 
 ## Tile source for DEM raycasting
 
@@ -78,22 +85,41 @@ Two changes from the original plan:
 2. **Vary zoom by distance** — z12 inside 30 km, z10 to 100 km, z9 to 200 km, fetching the annulus
    rather than a bounding box. Roughly 200 tiles per viewpoint instead of 6,400 at uniform z12.
 
-## The real fix: DEM raycasting
+## How the raycaster works
 
-1. Fetch Copernicus GLO-30 or SRTM 1-arcsecond tiles covering a radius around the viewpoint
-2. For each of ~3600 azimuths, march outward in ~30 m steps, sampling elevation bilinearly
-3. Track the running max apparent altitude, applying curvature and refraction at each step
-4. Emit a horizon profile: azimuth -> altitude, plus the source coordinate of each horizon point
-5. Match OSM peaks to horizon points to decide visibility and label placement
-6. Cache profiles in IndexedDB keyed by rounded viewpoint so it works offline
+All of it in `horizon-worker.js`, off the main thread.
 
-Precompute server-side or in a Web Worker. A 300 km radius at 30 m is too much to raycast on the
-main thread.
+1. Work out which tiles the three distance rings need, as annuli rather than bounding boxes
+2. Fetch them six at a time, decode with `createImageBitmap` + `OffscreenCanvas`, store as `Int16`
+   metres (a metre is far finer than the horizon maths can use, and it halves the footprint)
+3. Build one step ladder shared by every ray, precomputing the spherical direct-geodesic constants
+   that depend only on distance — so a sample costs one `atan2`, one `log` and a `sqrt`, not a full
+   geodesic solve
+4. March each of 3600 azimuths, sampling elevation bilinearly, tracking the maximum *tangent* of the
+   apparent altitude rather than the angle: `atan2` is monotonic so the argmax is identical, and it
+   saves a transcendental on every one of ~7 million samples
+5. Emit azimuth → altitude plus the coordinate and distance of each horizon point, transferring the
+   typed arrays rather than copying them
+
+Measured from Denver Civic Center: 163 tiles in 2.1 s, 3600 azimuths in 1.6 s on a desktop.
+
+The value finally emitted goes back through the same `atan2` form `apparentAlt()` uses, and
+`test/horizon.test.mjs` pins the two against each other — they live in different files and would
+otherwise drift, and a silent drift means the silhouette and the occlusion disagree with nothing to
+show for it.
+
+### Accuracy
+
+From Denver Civic Center the profile puts Longs Peak at 1.64° and 78.5 km, with the horizon point at
+40.2562 / −105.6175 against the table's 40.2549 / −105.6151 — about 180 m out on a 30 m grid.
+`apparentAlt` on the table's own figures says 1.70°; the 0.06° gap is the DEM reading the summit a
+few metres lower than the survey.
 
 ## Tests
 
 ```bash
-node test/projection.test.mjs
+node test/projection.test.mjs   # geometry, calibration, prefs, render paths
+node test/horizon.test.mjs      # tile indexing, step ladder, raycast vs apparentAlt
 ```
 
 `test/harness.mjs` pulls the real `<script>` out of `index.html` and runs it against a minimal DOM
@@ -129,6 +155,8 @@ Everything is in `index.html`:
 | geodesy block | distance, bearing, apparentAlt, sunPos |
 | `compute()` | Per-viewpoint peak resolution, occlusion, ridge polylines |
 | `basisFromOrientation()` | Device orientation to world-frame camera basis |
+| horizon block | IndexedDB cache, worker lifecycle, profile lookup |
+| calibration block | Two-point FOV and axis solve |
 | `projectAR()` | Pinhole projection with alignment offsets |
 | `drawAR()` / `drawPanorama()` | The two render paths |
 

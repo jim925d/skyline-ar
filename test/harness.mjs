@@ -51,6 +51,10 @@ export function load({ width = 390, height = 780, screenAngle = 0 } = {}) {
                     setItem: (k, v) => store.set(k, String(v)),
                     removeItem: k => store.delete(k) },
     screen: { orientation: { angle: screenAngle, addEventListener(){} } },
+    indexedDB: { open: () => { const r = { onupgradeneeded: null, onsuccess: null, onerror: null };
+                               return r; } },        // never fires: cache lookups stay pending, which is fine
+    Worker: undefined,
+    Float64Array, Int16Array, Int8Array, Promise, Function, Error, performance: { now: () => 0 },
     navigator: { geolocation: null, mediaDevices: null },
     document: { getElementById: getEl, createElement: () => stubEl("new"),
                 addEventListener(){}, body: stubEl("body") },
@@ -64,7 +68,7 @@ export function load({ width = 390, height = 780, screenAngle = 0 } = {}) {
   sandbox.DeviceOrientationEvent = undefined;
 
   const ctx = vm.createContext(sandbox);
-  vm.runInContext(src + "\n;globalThis.__api={state,basisFromOrientation,projectAR,focalPx,fovFromFocal,worldVec,dot,compute,draw,resize,dist,bearing,apparentAlt,loadPrefs,savePrefs,syncPrefControls,solveAxis,solveFov,calStart,calPick,calStop,calDrag,drawAR,drawPanorama};", ctx,
+  vm.runInContext(src + "\n;globalThis.__api={state,basisFromOrientation,projectAR,focalPx,fovFromFocal,worldVec,dot,compute,draw,resize,dist,bearing,apparentAlt,loadPrefs,savePrefs,syncPrefControls,solveAxis,solveFov,calStart,calPick,calStop,calDrag,drawAR,drawPanorama,horizonAltAt,horizonDistAt,viewKey,currentKey};", ctx,
                   { filename: "index.html#script" });
 
   const api = vm.runInContext("__api", ctx);

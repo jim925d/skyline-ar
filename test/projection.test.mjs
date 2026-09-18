@@ -273,5 +273,86 @@ console.log("\n-- render paths and the calibration state machine --");
   }
 }
 
+console.log("\n-- horizon profile: lookup, occlusion, both render paths --");
+{
+  const mk = () => { const h = load({ screenAngle: 0 });
+    h.el("vid").videoWidth = 1920; h.el("vid").videoHeight = 1080;
+    h.api.state.orient = { alpha: 90, beta: 90, gamma: 0 };
+    h.api.state.lat = 39.7392; h.api.state.lon = -104.9903; h.api.state.elev = 1609;
+    return h; };
+
+  /* A synthetic profile: a 3 deg wall from 260 to 280 deg, flat 0.2 deg
+     elsewhere, and a blind sector around 100 deg where the raycast found no
+     tiles. Real enough to exercise every branch. */
+  const synth = () => {
+    const n = 3600, alt = new Float32Array(n), srcDist = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const az = i * 0.1;
+      alt[i] = (az >= 260 && az <= 280) ? 3.0 : 0.2;
+      srcDist[i] = (az >= 260 && az <= 280) ? 60000 : 20000;
+      if (az >= 95 && az <= 105) { alt[i] = NaN; srcDist[i] = NaN; }
+    }
+    return { n, dAz: 0.1, alt, srcDist, srcLat: new Float32Array(n), srcLon: new Float32Array(n),
+             key: "synthetic", created: Date.now() };
+  };
+
+  { const { api } = mk(); api.state.horizon = synth();
+    near(api.horizonAltAt(270), 3.0, 1e-6, "profile reads 3 deg inside the wall");
+    near(api.horizonAltAt(200), 0.2, 1e-6, "profile reads 0.2 deg outside it");
+    near(api.horizonAltAt(0), 0.2, 1e-6, "profile reads at azimuth 0");
+    near(api.horizonAltAt(360), api.horizonAltAt(0), 1e-9, "360 and 0 are the same sample");
+    near(api.horizonAltAt(-10), api.horizonAltAt(350), 1e-9, "negative azimuths wrap");
+    near(api.horizonAltAt(359.95), api.horizonAltAt(359.95), 1e-9, "interpolating across the 360 seam does not throw");
+    ok(api.horizonAltAt(100) !== api.horizonAltAt(100), "a blind sector reads NaN");
+    near(api.horizonDistAt(270) / 1000, 60, 1e-6, "profile carries the horizon point's distance");
+  }
+
+  { // occlusion: the wall hides everything below 3 deg behind it, and nothing elsewhere
+    const { api } = mk();
+    api.state.range = 300;
+    api.state.horizon = synth();
+    api.compute();
+    const inWall = api.state.visible.filter(p => p.az >= 261 && p.az <= 279);
+    const outside = api.state.visible.filter(p => p.az < 259 || p.az > 281);
+    ok(inWall.length > 0, `${inWall.length} peaks sit behind the synthetic wall`);
+    ok(inWall.every(p => p.vis === (p.alt > 3.0 - 0.08)),
+       "every peak behind the wall is hidden exactly when it fails to clear it");
+    ok(outside.some(p => p.vis), "peaks outside the wall are still visible");
+  }
+
+  { // a blind sector must not silently hide peaks -- it falls back to the bin buffer
+    const { api } = mk();
+    api.state.horizon = synth();
+    api.compute();
+    const blind = api.state.visible.filter(p => p.az >= 96 && p.az <= 104);
+    ok(blind.every(p => typeof p.vis === "boolean"),
+       "peaks in a blind sector keep a visibility verdict from the fallback");
+  }
+
+  { // both render paths must survive a profile
+    const noThrow = (fn, what) => { try { fn(); ok(true, what); } catch (e) { ok(false, `${what} -- threw ${e}`); } };
+    const { api } = mk(); api.state.horizon = synth(); api.compute();
+    api.state.mode = "camera"; noThrow(() => api.draw(), "camera mode renders the profile silhouette");
+    api.state.mode = "draw";   noThrow(() => api.draw(), "drawing mode renders the profile silhouette");
+    api.state.horizon = null;  noThrow(() => api.draw(), "drawing mode still renders with no profile");
+    api.state.mode = "camera"; noThrow(() => api.draw(), "camera mode still renders with no profile");
+  }
+
+  { // labels need a screen position in both paths, profile or not
+    const { api } = mk(); api.state.horizon = synth(); api.compute();
+    api.state.mode = "camera"; api.draw();
+    ok(api.state.visible.some(p => p._x !== undefined), "camera mode still places peak apexes with a profile");
+    api.state.mode = "draw"; api.draw();
+    ok(api.state.visible.some(p => p._x !== undefined), "drawing mode still places peak apexes with a profile");
+  }
+
+  { // cache key rounds the viewpoint, so GPS jitter reuses the profile
+    const { api } = mk();
+    const a = api.viewKey(39.7392, -104.9903, 1610.7);
+    ok(api.viewKey(39.7395, -104.9906, 1613) === a, "a 40 m GPS wobble keeps the same cache key");
+    ok(api.viewKey(39.9990, -105.2820, 1751.7) !== a, "a different viewpoint gets a different key");
+  }
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
