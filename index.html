@@ -239,13 +239,46 @@ const state={
   lat:39.7392, lon:-104.9903, elev:1609, eye:1.7, label:"Denver — Civic Center",
   range:160, minAng:-0.6, units:"ft", sun:true,
   mode:"draw",                 // "camera" | "draw"
-  fovLong:67, headOff:0, pitchOff:0,
+  fovLong:67, headOff:0, pitchOff:0, fovCalibrated:false,
   aligning:false, locked:false,
   orient:null,                 // {alpha,beta,gamma} degrees, north-referenced
   screenAngle:0,
   drawAz:270, drawAlt:2.2, drawFov:90,
   peaks:PEAKS.slice(), visible:[], selected:null
 };
+
+/* ---------------- persisted settings ---------------- */
+/* Alignment is hard-won in the field: a magnetometer nudge and a solved FOV
+   should survive a reload, a backgrounded tab and a lost camera permission. */
+
+const PREFS_KEY="skyline-ar.prefs.v1";
+const PREFS_FIELDS=["fovLong","headOff","pitchOff","units","range","minAng","sun","fovCalibrated"];
+
+function loadPrefs(){
+  let raw;
+  try{ raw=localStorage.getItem(PREFS_KEY); }catch(e){ return; }   // Safari private mode throws
+  if(!raw) return;
+  let o; try{ o=JSON.parse(raw); }catch(e){ return; }
+  if(!o||typeof o!=="object") return;
+  if(Number.isFinite(o.fovLong))  state.fovLong =clampNum(o.fovLong,30,100);
+  if(Number.isFinite(o.headOff))  state.headOff =clampNum(o.headOff,-30,30);
+  if(Number.isFinite(o.pitchOff)) state.pitchOff=clampNum(o.pitchOff,-20,20);
+  if(Number.isFinite(o.range))    state.range   =clampNum(o.range,20,300);
+  if(Number.isFinite(o.minAng))   state.minAng  =clampNum(o.minAng,-2,3);
+  if(o.units==="ft"||o.units==="m") state.units=o.units;
+  if(typeof o.sun==="boolean") state.sun=o.sun;
+  state.fovCalibrated=!!o.fovCalibrated;
+}
+let saveTimer=null;
+function savePrefs(){
+  clearTimeout(saveTimer);
+  saveTimer=setTimeout(()=>{
+    const o={}; for(const k of PREFS_FIELDS) o[k]=state[k];
+    try{ localStorage.setItem(PREFS_KEY,JSON.stringify(o)); }catch(e){}
+  },250);
+}
+function clearPrefs(){ try{ localStorage.removeItem(PREFS_KEY); }catch(e){} }
+const clampNum=(v,a,b)=>Math.max(a,Math.min(b,v));
 
 const $=id=>document.getElementById(id);
 const cv=$("c"), ctx=cv.getContext("2d"), vid=$("vid");
@@ -688,7 +721,9 @@ cv.addEventListener("pointermove",e=>{
     const d=Math.hypot(a.x-b.x,a.y-b.y);
     if(state.mode==="camera"){
       state.fovLong=Math.max(30,Math.min(100,pinch.fov*pinch.d/Math.max(d,1)));
+      state.fovCalibrated=false;
       $("fov").value=state.fovLong.toFixed(1); $("fovVal").textContent=state.fovLong.toFixed(1)+"°";
+      savePrefs();
     }else{
       state.drawFov=Math.max(8,Math.min(140,pinch.fov*pinch.d/Math.max(d,1)));
     }
@@ -701,7 +736,7 @@ cv.addEventListener("pointermove",e=>{
     state.headOff=clamp(state.headOff-dx*degPerPx,-30,30);
     state.pitchOff=clamp(state.pitchOff+dy*degPerPx,-20,20);
     $("hoff").value=state.headOff.toFixed(1); $("hoffVal").textContent=state.headOff.toFixed(1)+"°";
-    draw();
+    savePrefs(); draw();
   }else{
     state.drawAz=(state.drawAz-dx/ppdDraw()+360)%360;
     state.drawAlt=state.drawAlt+dy/ppdDraw();
@@ -720,7 +755,9 @@ cv.addEventListener("wheel",e=>{
   e.preventDefault();
   if(state.mode==="camera"){
     state.fovLong=clamp(state.fovLong*(1+Math.sign(e.deltaY)*.06),30,100);
+    state.fovCalibrated=false;
     $("fov").value=state.fovLong.toFixed(1); $("fovVal").textContent=state.fovLong.toFixed(1)+"°";
+    savePrefs();
   } else state.drawFov=clamp(state.drawFov*(1+Math.sign(e.deltaY)*.08),8,140);
   draw();
 },{passive:false});
@@ -775,16 +812,20 @@ $("btnLock").onclick=()=>{
   $("btnLock").setAttribute("aria-pressed",state.locked?"true":"false");
   $("btnLock").textContent=state.locked?"Locked":"Lock heading";
 };
-$("btnSun").onclick=()=>{ state.sun=!state.sun; $("btnSun").setAttribute("aria-pressed",state.sun?"true":"false"); draw(); };
+$("btnSun").onclick=()=>{ state.sun=!state.sun; $("btnSun").setAttribute("aria-pressed",state.sun?"true":"false");
+  savePrefs(); draw(); };
 $("btnUnits").onclick=()=>{ state.units=state.units==="ft"?"m":"ft"; $("btnUnits").textContent=state.units;
-  syncInputs(); paintList(); state.selected?showReadout(state.selected):draw(); };
+  savePrefs(); syncInputs(); paintList(); state.selected?showReadout(state.selected):draw(); };
 $("btnTray").onclick=()=>{ const t=$("tray"); t.classList.toggle("open");
   $("btnTray").textContent=t.classList.contains("open")?"Done":"Setup"; setTimeout(resize,230); };
 
-$("fov").oninput=e=>{ state.fovLong=+e.target.value; $("fovVal").textContent=state.fovLong.toFixed(1)+"°"; draw(); };
-$("hoff").oninput=e=>{ state.headOff=+e.target.value; $("hoffVal").textContent=state.headOff.toFixed(1)+"°"; draw(); };
-$("btnReset").onclick=()=>{ state.headOff=0; state.pitchOff=0; state.fovLong=67;
-  $("hoff").value=0; $("hoffVal").textContent="0°"; $("fov").value=67; $("fovVal").textContent="67°"; draw(); };
+$("fov").oninput=e=>{ state.fovLong=+e.target.value; state.fovCalibrated=false;
+  $("fovVal").textContent=state.fovLong.toFixed(1)+"°"; savePrefs(); draw(); };
+$("hoff").oninput=e=>{ state.headOff=+e.target.value; $("hoffVal").textContent=state.headOff.toFixed(1)+"°";
+  savePrefs(); draw(); };
+$("btnReset").onclick=()=>{ state.headOff=0; state.pitchOff=0; state.fovLong=67; state.fovCalibrated=false;
+  $("hoff").value=0; $("hoffVal").textContent="0°"; $("fov").value=67; $("fovVal").textContent="67°";
+  clearPrefs(); draw(); };
 
 const sel=$("view");
 VIEWS.forEach((v,i)=>{const o=document.createElement("option");o.value=i;o.textContent=v[0];sel.appendChild(o);});
@@ -810,8 +851,8 @@ $("btnGeo").onclick=()=>{
   },()=>{ $("btnGeo").textContent="Use my location"; alert("Location unavailable — type coordinates instead."); },
   {enableHighAccuracy:true,timeout:10000});
 };
-$("range").oninput=e=>{ state.range=+e.target.value; $("rangeVal").textContent=state.range+" km"; refresh(); };
-$("minang").oninput=e=>{ state.minAng=+e.target.value; $("minangVal").textContent=state.minAng.toFixed(1)+"°"; refresh(); };
+$("range").oninput=e=>{ state.range=+e.target.value; $("rangeVal").textContent=state.range+" km"; savePrefs(); refresh(); };
+$("minang").oninput=e=>{ state.minAng=+e.target.value; $("minangVal").textContent=state.minAng.toFixed(1)+"°"; savePrefs(); refresh(); };
 
 function paintList(){
   const el=$("plist"); el.innerHTML="";
@@ -864,9 +905,20 @@ $("btnPaste").onclick=()=>{
 /* ---------------- boot ---------------- */
 
 function refresh(){ compute(); draw(); }
+
+function syncPrefControls(){
+  $("fov").value=state.fovLong.toFixed(1);   $("fovVal").textContent=state.fovLong.toFixed(1)+"°";
+  $("hoff").value=state.headOff.toFixed(1);  $("hoffVal").textContent=state.headOff.toFixed(1)+"°";
+  $("range").value=state.range;              $("rangeVal").textContent=state.range+" km";
+  $("minang").value=state.minAng;            $("minangVal").textContent=state.minAng.toFixed(1)+"°";
+  $("btnUnits").textContent=state.units;
+  $("btnSun").setAttribute("aria-pressed",state.sun?"true":"false");
+}
 if(!window.isSecureContext){
   $("gateWarn").textContent="Heads up: this page isn't on https, so the camera and compass will be blocked. Host it and open the https link — the drawn panorama works either way.";
 }
+loadPrefs();
+syncPrefControls();
 setModeUI();
 syncInputs();
 resize();
