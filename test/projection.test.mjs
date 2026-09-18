@@ -207,5 +207,71 @@ console.log("\n-- FOV calibration solvers --");
   }
 }
 
+console.log("\n-- render paths and the calibration state machine --");
+{
+  const mk = () => { const h = load({ screenAngle: 0 });
+    h.el("vid").videoWidth = 1920; h.el("vid").videoHeight = 1080;
+    h.api.state.orient = { alpha: 90, beta: 90, gamma: 0 };
+    h.api.state.lat = 39.7392; h.api.state.lon = -104.9903; h.api.state.elev = 1609;
+    h.api.compute(); return h; };
+
+  const noThrow = (fn, what) => { try { fn(); ok(true, what); } catch (e) { ok(false, `${what} -- threw ${e}`); } };
+
+  { const { api } = mk(); api.state.mode = "draw";   noThrow(() => api.draw(), "drawing mode renders"); }
+  { const { api } = mk(); api.state.mode = "camera"; noThrow(() => api.draw(), "camera mode renders"); }
+  { const { api } = mk(); api.state.mode = "camera"; api.state.aligning = true;
+    noThrow(() => api.draw(), "align mode renders"); }
+
+  { // full calibration walkthrough, both steps, driven through the real handlers
+    const { api, el } = mk();
+    api.state.mode = "camera";
+    api.calStart();
+    ok(api.state.cal !== null && api.state.cal.step === 1, "calStart enters step 1");
+    noThrow(() => api.draw(), "step 1 renders before a peak is chosen");
+
+    const peaks = api.state.visible.filter(p => p.vis);
+    const near270 = peaks.reduce((b, p) => Math.abs(p.az - 270) < Math.abs(b.az - 270) ? p : b, peaks[0]);
+    api.calPick(near270);
+    ok(api.state.cal.peak === near270, "step 1 accepts a tapped peak");
+    noThrow(() => api.draw(), "step 1 renders with a peak chosen");
+
+    const b = api.basisFromOrientation(), f = api.focalPx();
+    const at = api.projectAR(b, f, near270.az, near270.alt);
+    if (at) {
+      api.calDrag(at.x + 18, at.y - 11);
+      const after = api.projectAR(api.basisFromOrientation(), api.focalPx(), near270.az, near270.alt);
+      near(after.x, at.x + 18, 0.5, "step 1 drag moves the peak under the finger (x)");
+      near(after.y, at.y - 11, 0.5, "step 1 drag moves the peak under the finger (y)");
+    } else ok(false, "step 1 peak is in front of the camera");
+
+    el("calNext").onclick();
+    ok(api.state.cal.step === 2 && api.state.cal.peak === null, "Next advances to step 2 and clears the peak");
+
+    const first = api.state.cal.first;
+    api.calPick({ n: first, az: near270.az, alt: near270.alt });
+    ok(api.state.cal.peak === null, "step 2 refuses the peak used in step 1");
+
+    noThrow(() => api.draw(), "step 2 renders");
+    el("calCancel") && (api.calStop(), ok(api.state.cal === null, "Cancel leaves calibration"));
+  }
+
+  { // calibration must not touch drawing mode
+    const { api } = mk();
+    api.state.mode = "draw";
+    api.calStart();
+    ok(api.state.cal === null, "calibration refuses to start without the camera");
+    noThrow(() => api.draw(), "drawing mode still renders after a refused calStart");
+  }
+
+  { // the non-absolute fallback lands in drawing mode and still renders
+    const { api } = mk();
+    api.state.mode = "camera"; api.state.absoluteOk = false;
+    api.state.mode = "draw";
+    noThrow(() => api.draw(), "drawing-mode fallback renders");
+    api.state.mode = "camera"; api.state.absoluteOverride = true;
+    noThrow(() => api.draw(), "camera with the relative-compass warning bar renders");
+  }
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
